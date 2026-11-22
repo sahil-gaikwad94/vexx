@@ -90,7 +90,7 @@ The result: structured generation that cannot lie, with an audit trail you can f
 
 ---
 
-## 🆕 Vexx 1.5 in 30 seconds
+## 🆕 Vexx 2.1 in 30 seconds
 
 ```python
 import vexx as vt
@@ -115,7 +115,7 @@ def issue_refund(args, state):
 #   vexx serve --upstream http://localhost:11434/v1 --spec-module schemas.py --port 8080
 ```
 
-Full notes: [docs/1.5-release.md](docs/1.5-release.md).
+Full notes: [docs/2.1-release.md](docs/2.1-release.md) (Vexx 1.5 history: [docs/1.5-release.md](docs/1.5-release.md)).
 
 ---
 

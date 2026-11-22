@@ -166,6 +166,73 @@ from .token_healer import (
 )
 from .zero_dof import ZeroDofEngine
 
+# --- Vexx 2.1 code engine -------------------------------------------------
+from .code_engine import (
+    CodeEngineConfig,
+    VexxCodeController,
+    CodeSession,
+    LexerState,
+    advance_lexer_state,
+)
+from .code_engine.contracts import (
+    ParameterContract,
+    CallableContract,
+    CallCheck,
+    build_contracts,
+    header_contract_from_text,
+    check_call,
+    extract_ast_symbol_table,
+    UNKNOWN_DYNAMIC_DISPATCH,
+)
+from .code_engine.masking import DeadEnd
+from .cas import (
+    safe_sympy,
+    crane_cas_evaluate,
+    solve_linear_system,
+    integrate_definite,
+    modular_pow,
+    OptionalDependencyError,
+)
+from .calibration import (
+    Diagnostic,
+    parse_unit_dimensions,
+    verify_statistical_report,
+    verify_epistemic_calibration,
+)
+from .cache_protocol import (
+    RewindableCache,
+    clone_cache_generic,
+    create_empty_hybrid_cache_v2,
+    truncate_cache_at_token,
+)
+from .code_engine.conflict import CodeCheckpoint, BoundCut, contract_single_row
+from .code_engine.sandbox import SandboxRunner, ExecutionResult
+from .code_engine.candidate import CandidateReport, CandidateVerifier
+from .maya_generate import generate_maya, GenerationResult, PLAIN, PYTHON, JSON, THINK
+from .code_engine.experiments import ExperimentEpisode, ExperimentResult
+from .rl.code_rewards import (
+    compute_code_rewards,
+    export_code_preferences,
+    execution_reward,
+)
+from .bridges.code_hf import VexxCodeLogitsProcessor
+
+import warnings as _warnings
+
+
+class _DeprecatedAlias(VexxCodeController):
+    def __init__(self, *args, **kwargs):
+        _warnings.warn(
+            f"{type(self).__name__} is deprecated; use VexxCodeController instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        super().__init__(*args, **kwargs)
+
+
+Vexx35Controller = type("Vexx35Controller", (_DeprecatedAlias,), {})
+Vexx3Controller = type("Vexx3Controller", (_DeprecatedAlias,), {})
+
 # ---------------------------------------------------------------------------
 # top-level convenience
 # ---------------------------------------------------------------------------
@@ -363,6 +430,48 @@ __all__ = [
     "ClauseCheckpoint",
     "ConflictBranchRecord",
     "TabuPrefixTrie",
+    # Vexx 2.1 code engine
+    "CodeEngineConfig",
+    "VexxCodeController",
+    "CodeSession",
+    "LexerState",
+    "advance_lexer_state",
+    "ParameterContract",
+    "CallableContract",
+    "CallCheck",
+    "build_contracts",
+    "header_contract_from_text",
+    "check_call",
+    "extract_ast_symbol_table",
+    "UNKNOWN_DYNAMIC_DISPATCH",
+    "DeadEnd",
+    "safe_sympy",
+    "crane_cas_evaluate",
+    "solve_linear_system",
+    "integrate_definite",
+    "modular_pow",
+    "OptionalDependencyError",
+    "Diagnostic",
+    "parse_unit_dimensions",
+    "verify_statistical_report",
+    "verify_epistemic_calibration",
+    "RewindableCache",
+    "clone_cache_generic",
+    "create_empty_hybrid_cache_v2",
+    "truncate_cache_at_token",
+    "CodeCheckpoint",
+    "BoundCut",
+    "contract_single_row",
+    "SandboxRunner",
+    "ExecutionResult",
+    "CandidateReport",
+    "CandidateVerifier",
+    "ExperimentEpisode",
+    "ExperimentResult",
+    "compute_code_rewards",
+    "export_code_preferences",
+    "execution_reward",
+    "VexxCodeLogitsProcessor",
     # decoding
     "generate",
     "VexxSession",
