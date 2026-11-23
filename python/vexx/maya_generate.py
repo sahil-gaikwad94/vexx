@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, List, Optional
+from typing import Any
 
 try:
     import numpy as np
@@ -33,7 +33,7 @@ class GenerationResult:
     finish_reason: str
     tokens_generated: int
     truncated: bool
-    provenance: List[str] = field(default_factory=list)
+    provenance: list[str] = field(default_factory=list)
     num_loops: int = 0
 
     @property
@@ -58,7 +58,7 @@ def top_p_filter(logits, top_p: float):
     return filtered.squeeze(0) if squeeze else filtered
 
 
-def sample_next(logits, temperature: Optional[float] = 0.0, top_p: Optional[float] = None, generator=None):
+def sample_next(logits, temperature: float | None = 0.0, top_p: float | None = None, generator=None):
     if torch is None or isinstance(logits, np.ndarray):
         arr = np.asarray(logits)
         return np.argmax(arr, axis=-1, keepdims=True)
@@ -76,15 +76,15 @@ def generate_maya(
     tokenizer: Any,
     prompt: str,
     max_new_tokens: int = 64,
-    temperature: Optional[float] = 0.0,
-    top_p: Optional[float] = None,
+    temperature: float | None = 0.0,
+    top_p: float | None = None,
     vexx: Any = None,
     add_bos: bool = True,
-    seed: Optional[int] = None,
+    seed: int | None = None,
     mode: str = PLAIN,
-    provenance: Optional[List[str]] = None,
+    provenance: list[str] | None = None,
     context_mode: str = "rolling_window",
-    num_loops: Optional[int] = None,
+    num_loops: int | None = None,
 ) -> GenerationResult:
     if mode not in VALID_MODES:
         raise ValueError(f"unknown decoding mode {mode!r}; valid: {sorted(VALID_MODES)}")
@@ -92,7 +92,7 @@ def generate_maya(
         raise ValueError(f"unknown context_mode {context_mode!r}")
 
     model.eval() if hasattr(model, "eval") else None
-    origins: List[str] = ["neural_generation"]
+    origins: list[str] = ["neural_generation"]
 
     encode = getattr(tokenizer, "encode", None)
     ids = encode(prompt, add_bos=add_bos, add_eos=False) if encode else []
@@ -121,7 +121,7 @@ def generate_maya(
     if truncated or (truncation_info or {}).get("truncated"):
         origins.append("prompt_truncated")
 
-    generated: List[int] = []
+    generated: list[int] = []
     eos_id = getattr(tokenizer, "token_to_id", {}).get("<eos>")
     exp_end_id = getattr(tokenizer, "token_to_id", {}).get("</experiment>")
 

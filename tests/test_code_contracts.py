@@ -15,8 +15,6 @@ from vexx.code_engine.contracts import (
     POS_ONLY,
     POS_OR_KEYWORD,
     UNKNOWN_DYNAMIC_DISPATCH,
-    VAR_KEYWORD,
-    VAR_POSITIONAL,
     CallableContract,
     ParameterContract,
     build_contracts,

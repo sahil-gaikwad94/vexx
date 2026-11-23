@@ -2,31 +2,31 @@
 
 from __future__ import annotations
 
+from .candidate import CandidateReport, CandidateVerifier
 from .config import CodeEngineConfig
+from .conflict import BoundCut, CodeCheckpoint, contract_single_row
 from .contracts import (
+    KEYWORD_ONLY,
     POS_ONLY,
     POS_OR_KEYWORD,
     UNKNOWN_DYNAMIC_DISPATCH,
     VAR_KEYWORD,
     VAR_POSITIONAL,
-    KEYWORD_ONLY,
-    CallCheck,
     CallableContract,
+    CallCheck,
     ParameterContract,
     build_contracts,
     check_call,
     header_contract_from_text,
 )
+from .controller import VexxCodeController
+from .controller import VexxCodeController as _VC  # noqa: F401
+from .experiments import ExperimentEpisode, ExperimentResult
 from .lexer import LexerState, advance_lexer_state
 from .masking import CodeSession, DeadEnd
-from .controller import VexxCodeController
 from .policy import CodePolicyError, check_ast_policy
 from .protocol import ProtocolConfig, ProtocolPhase, ProtocolTracker
-from .sandbox import SandboxRunner, ExecutionResult
-from .candidate import CandidateReport, CandidateVerifier
-from .experiments import ExperimentEpisode, ExperimentResult
-from .conflict import CodeCheckpoint, BoundCut, contract_single_row
-from .controller import VexxCodeController as _VC  # noqa: F401
+from .sandbox import ExecutionResult, SandboxRunner
 
 __all__ = [
     "CodeEngineConfig",

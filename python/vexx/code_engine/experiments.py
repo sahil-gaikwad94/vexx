@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import ast
 from dataclasses import dataclass, field
-from typing import Any
 
 from .config import CodeEngineConfig
-from .policy import check_ast_policy, CodePolicy
+from .policy import CodePolicy, check_ast_policy
 from .sandbox import SandboxRunner
 
 

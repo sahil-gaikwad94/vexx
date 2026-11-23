@@ -7,11 +7,9 @@ import json
 import math
 import os
 import tempfile
-from dataclasses import dataclass
 from typing import Any
 
 from ..code_engine.candidate import CandidateVerifier
-
 
 REWARD_LADDER = {
     "syntax_or_policy": -0.5,

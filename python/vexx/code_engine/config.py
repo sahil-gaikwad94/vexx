@@ -9,7 +9,7 @@ decode.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 __all__ = ["CodeEngineConfig", "DEFAULT_ALLOWED_IMPORTS", "CODE_MODES", "UNKNOWN_CALL_POLICIES"]

@@ -30,7 +30,6 @@ def clone_cache_generic(cache: Any) -> Any:
     except Exception:
         pass
     try:
-        import torch
         if hasattr(cache, "detach"):
             return cache.clone()
     except Exception:

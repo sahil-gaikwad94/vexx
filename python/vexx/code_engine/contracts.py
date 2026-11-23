@@ -26,7 +26,6 @@ import ast
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any
 
 __all__ = [
     "POS_ONLY",

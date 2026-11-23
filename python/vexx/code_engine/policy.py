@@ -12,8 +12,8 @@ so explicitly, and the resulting profile is recorded in the candidate report.
 from __future__ import annotations
 
 import ast
-from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Iterable
+from dataclasses import dataclass
 
 from .config import DEFAULT_ALLOWED_IMPORTS
 
@@ -47,17 +47,14 @@ _FORBIDDEN_ATTRS = frozenset({
     "__init__", "__new__", "__del__", "__class_getitem__",
     "__reduce__", "__reduce_ex__", "__getstate__", "__setstate__",
     "__getattribute__", "__setattr__", "__delattr__", "__getattr__",
-    "__instancecheck__", "__subclasscheck__", "__class_getitem__",
-    "__bases__", "__mro_entries__", "__set_name__",
+    "__instancecheck__", "__subclasscheck__", "__mro_entries__", "__set_name__",
     "__get__", "__set__", "__delete__", "__objclass__",
-    "__func__", "__self__", "__closure__", "__code__", "__defaults__",
-    "__kwdefaults__", "__annotations__", "__globals__",
-    "__wrapped__", "__module__", "__doc__",
+    "__func__", "__self__", "__closure__", "__defaults__",
+    "__kwdefaults__", "__annotations__", "__wrapped__", "__module__", "__doc__",
     "__name__", "__qualname__", "__type_params__",
-    "__dict__", "__weakref__", "__slots__", "__prepare__",
-    "__set_name__", "__instancecheck__", "__subclasscheck__",
-    "__class_getitem__", "__getnewargs__", "__getnewargs_ex__",
-    "__sizeof__", "__dir__", "__class__",
+    "__weakref__", "__slots__", "__prepare__",
+    "__getnewargs__", "__getnewargs_ex__",
+    "__sizeof__", "__dir__",
 })
 
 #: Attribute names that expose frame/code introspection — must never be reachable.
@@ -66,7 +63,7 @@ _FRAME_ATTRS = frozenset({
     "f_globals", "f_builtins", "f_locals", "f_back", "f_code",
     "gi_code", "gi_yieldfrom", "cr_code", "cr_origin",
     "ag_code", "ag_arg", "ag_locals", "ag_kwargs",
-    "tb_frame", "tb_next", "tb_lasti", "tb_lineno",
+    "tb_next", "tb_lasti", "tb_lineno",
     "gi_suspended", "cr_running", "cr_await",
 })
 
@@ -84,8 +81,7 @@ _FORBIDDEN_IDENTIFIERS_EXT = frozenset({
     "http", "urllib", "ftplib", "smtplib", "telnetlib", "xmlrpc",
     "pickle", "shelve", "marshal", "dbm", "sqlite3",
     "importlib", "pkgutil", "modulefinder", "runpy", "pdb",
-    "gc", "weakref", "weakrefproxy", "atexit", "signal",
-    "copyreg", "reprlib", "enum", "graphlib", "heapq",
+    "gc", "weakref", "weakrefproxy", "atexit", "copyreg", "reprlib", "enum", "graphlib", "heapq",
 })
 
 

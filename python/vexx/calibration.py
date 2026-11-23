@@ -366,7 +366,7 @@ def verify_epistemic_calibration(text: str) -> Diagnostic | None:
         if m_b:
             units = m_b.group(1)
             return Diagnostic(kind="temporal_supersession", verdict=f"{units} units", confidence="heuristic",
-                              explanation=f"Source B supersedes Source A.", rule_id="SUPERSESSION")
+                              explanation="Source B supersedes Source A.", rule_id="SUPERSESSION")
 
     if "optional online poll" in p_lower or ("visitors" in p_lower and "blog" in p_lower):
         return Diagnostic(kind="sampling_bias", verdict="not justified", confidence="heuristic",

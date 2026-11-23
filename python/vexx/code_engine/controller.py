@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 try:
     import numpy as np
 except ImportError:
     np = None
 
-from .config import CodeEngineConfig
-from .contracts import build_contracts
 from .lexer import LexerState, advance_lexer_state
-from .masking import CodeSession, VexxCodeController as _Base, DeadEnd
+from .masking import CodeSession
+from .masking import VexxCodeController as _Base
 
 
 class VexxCodeController(_Base):
@@ -89,7 +89,6 @@ class VexxCodeController(_Base):
 
     @staticmethod
     def _lex_code_state(code_prefix: str) -> dict:
-        from .lexer import LexerState, advance_lexer_state
         state = advance_lexer_state(LexerState(), code_prefix)
         # A quote that remains suspended inside an f-string replacement field at
         # end-of-input is not a legal nested string opener (Maya parity).
@@ -151,7 +150,7 @@ class VexxCodeController(_Base):
         entropy: float,
         proposed_val: float,
     ) -> None:
-        from ..cache_protocol import clone_cache_generic, _contains_recurrent_state
+        from ..cache_protocol import _contains_recurrent_state, clone_cache_generic
         if (
             isinstance(hybrid_cache, dict)
             and hybrid_cache.get("position") is not None
@@ -181,6 +180,7 @@ class VexxCodeController(_Base):
         assignment: dict[str, Any],
     ) -> tuple[int, Any, tuple[float, float]]:
         from fractions import Fraction
+
         from ..cache_protocol import clone_cache_generic, truncate_cache_at_token
         candidates = [cp for cp in self.checkpoints if cp["var"] in conflict_vars]
         if not candidates:

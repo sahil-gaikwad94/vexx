@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import builtins
 import functools
-import textwrap
 import inspect
+import textwrap
 from collections.abc import Callable
 from typing import Any
 
