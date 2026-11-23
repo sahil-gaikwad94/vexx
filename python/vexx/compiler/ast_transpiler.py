@@ -94,28 +94,33 @@ class AstTranspiler:
     _BUILTINS = {"abs": builtins.abs, "min": builtins.min, "max": builtins.max,
                  "len": builtins.len, "round": builtins.round}
 
-    def __init__(self, func, model, config=None):
+    def __init__(self, func, model, config=None, source=None):
         self.func = inspect.unwrap(func)
         self.model = model
         self.config = dict(config or {})
-        params = list(inspect.signature(self.func).parameters.values())
-        if len(params) != 1 or params[0].kind not in (inspect.Parameter.POSITIONAL_ONLY,
-                                                      inspect.Parameter.POSITIONAL_OR_KEYWORD):
-            raise TranspileError("schema function must take exactly one positional model parameter")
-        self.param_name = params[0].name
-        self.globals = dict(getattr(self.func, "__globals__", {}))
-        code = getattr(self.func, "__code__", None)
-        for name, cell in zip(getattr(code, "co_freevars", ()), getattr(self.func, "__closure__", ()) or ()):
+        self.source_override = source
+        if self.func is None:
+            self.param_name = None
+            self.globals = {}
+        else:
+            params = list(inspect.signature(self.func).parameters.values())
+            if len(params) != 1 or params[0].kind not in (inspect.Parameter.POSITIONAL_ONLY,
+                                                          inspect.Parameter.POSITIONAL_OR_KEYWORD):
+                raise TranspileError("schema function must take exactly one positional model parameter")
+            self.param_name = params[0].name
+            self.globals = dict(getattr(self.func, "__globals__", {}))
+            code = getattr(self.func, "__code__", None)
+            for name, cell in zip(getattr(code, "co_freevars", ()), getattr(self.func, "__closure__", ()) or ()):
+                try:
+                    self.globals[name] = cell.cell_contents
+                except ValueError:
+                    raise TranspileError(f"unbound closure constant {name!r}") from None
             try:
-                self.globals[name] = cell.cell_contents
-            except ValueError:
-                raise TranspileError(f"unbound closure constant {name!r}") from None
-        try:
-            hints = typing.get_type_hints(self.func, localns=self.globals)
-        except Exception:
-            hints = {}
-        if hints.get(self.param_name, params[0].annotation) is not model:
-            raise TranspileError("the resolved model annotation does not match the supplied model")
+                hints = typing.get_type_hints(self.func, localns=self.globals)
+            except Exception:
+                hints = {}
+            if hints.get(self.param_name, params[0].annotation) is not model:
+                raise TranspileError("the resolved model annotation does not match the supplied model")
         lowered = lower_pydantic_model(model)
         self.graph = lowered["graph"]
         self.var_table = lowered["var_table"]
@@ -132,21 +137,39 @@ class AstTranspiler:
         raise TranspileError(f"{self._source_name}:{line}: {message}")
 
     def transpile(self) -> VirSpec:
-        try:
-            file_name = inspect.getsourcefile(self.func) or "<schema>"
-            source, start = inspect.getsourcelines(self.func)
-        except (OSError, TypeError) as exc:
-            raise TranspileError(f"schema source is unavailable (define it in a Python module): {exc}") from exc
-        self._source_name = f"{file_name}:{start}"
-        try:
-            tree = ast.parse(textwrap.dedent("".join(source)))
-        except SyntaxError as exc:
-            raise TranspileError(f"invalid schema source: {exc}") from exc
-        matches = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-                   and n.name == self.func.__name__]
-        if not matches:
-            raise TranspileError("cannot locate the schema function in its source")
-        node = matches[0]
+        if self.source_override is not None:
+            src_text = self.source_override
+            self._source_name = "<provided>"
+            try:
+                tree = ast.parse(textwrap.dedent(src_text))
+            except SyntaxError as exc:
+                raise TranspileError(f"invalid schema source: {exc}") from exc
+            if self.func is not None:
+                matches = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                           and n.name == getattr(self.func, "__name__", None)]
+            else:
+                matches = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+            if not matches:
+                raise TranspileError("cannot locate the schema function in its source")
+            node = matches[0]
+            if self.param_name is None and node.args.args:
+                self.param_name = node.args.args[0].arg
+        else:
+            try:
+                file_name = inspect.getsourcefile(self.func) or "<schema>"
+                source, start = inspect.getsourcelines(self.func)
+            except (OSError, TypeError) as exc:
+                raise TranspileError(f"schema source is unavailable (define it in a Python module): {exc}") from exc
+            self._source_name = f"{file_name}:{start}"
+            try:
+                tree = ast.parse(textwrap.dedent("".join(source)))
+            except SyntaxError as exc:
+                raise TranspileError(f"invalid schema source: {exc}") from exc
+            matches = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                       and n.name == self.func.__name__]
+            if not matches:
+                raise TranspileError("cannot locate the schema function in its source")
+            node = matches[0]
         if isinstance(node, ast.AsyncFunctionDef):
             self._error(node, "schema declarations must be synchronous")
         
@@ -229,11 +252,18 @@ class AstTranspiler:
         return None
 
     def _dsl_name(self, call):
-        obj = self._resolve(call.func)
+        # Source-only / REPL mode: resolve by name when runtime objects are unavailable.
+        if isinstance(call.func, ast.Attribute) and call.func.attr in self._CALLS:
+            return call.func.attr
+        if isinstance(call.func, ast.Name) and call.func.id in self._CALLS:
+            return call.func.id
+        try:
+            obj = self._resolve(call.func)
+        except Exception:
+            obj = None
         name = getattr(obj, "_vexx_dsl", None)
         if name in self._CALLS:
             return name
-        # Direct imports from the DSL module are also identity checked.
         module = getattr(obj, "__module__", None)
         short = getattr(obj, "__name__", None)
         if module == "vexx.decorators" and short in self._CALLS:

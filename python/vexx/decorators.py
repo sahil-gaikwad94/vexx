@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import builtins
 import functools
+import textwrap
 import inspect
 from collections.abc import Callable
 from typing import Any
@@ -15,7 +16,7 @@ from .compiler.vir import VirSpec
 
 
 class VerifiedSchema:
-    def __init__(self, func: Callable, **config):
+    def __init__(self, func: Callable = None, source: str | None = None, model=None, **config):
         self.func = func
         self.config = {
             "solver": "auto",
@@ -29,8 +30,12 @@ class VerifiedSchema:
         self._validate_config()
         functools.update_wrapper(self, func)
         self.name = getattr(func, "__name__", "verified_schema")
-        self.model = self._resolve_model(func)
-        self.transpiler = AstTranspiler(func, self.model, self.config)
+        if model is not None:
+            self.model = model
+        else:
+            self.model = self._resolve_model(func)
+        self.source = source
+        self.transpiler = AstTranspiler(func, self.model, self.config, source=source)
         self.spec: VirSpec = self.transpiler.transpile()
         # topological field order already set in spec
         self.field_order = list(self.spec.field_order)
@@ -68,6 +73,8 @@ class VerifiedSchema:
                 raise ValueError(f"{key} must be boolean")
 
     def _resolve_model(self, func):
+        if func is None:
+            raise ValueError("model must be provided when func is None")
         sig = inspect.signature(func)
         params = list(sig.parameters.values())
         if not params:
@@ -134,6 +141,8 @@ class VerifiedSchema:
 
 def verified_schema(
     func=None,
+    source: str | None = None,
+    model=None,
     solver: str = "auto",
     reasoning_mode: str = "crane_cot",
     backtrack: str = "cdcl_domain_cut",
@@ -156,16 +165,46 @@ def verified_schema(
     config.update(extra)
 
     def decorator(f):
-        return VerifiedSchema(f, **config)
+        return VerifiedSchema(f, source=source, model=model, **config)
 
     if isinstance(func, VerifiedSchema):
         return func
+    if isinstance(func, str):
+        # Allow verified_schema(source_code) positional shorthand.
+        source = func
+        func = None
+    if func is None and source is not None:
+        # Programmatic builder fallback: require model to be supplied via extra or inferred.
+        model = extra.pop("model", None)
+        if model is None:
+            # Try to infer model from the source annotation.
+            try:
+                import ast as _ast
+                tree = _ast.parse(textwrap.dedent(source))
+                fn = next(n for n in _ast.walk(tree) if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef)))
+                ann = fn.args.args[0].annotation
+                ann_src = _ast.unparse(ann) if hasattr(_ast, "unparse") else None
+                if ann_src:
+                    model = None
+            except Exception:
+                model = None
+        # If no model, cannot proceed; return a factory expecting model.
+        if model is None:
+            def _factory(model_cls):
+                return VerifiedSchema(None, source=source, model=model_cls, **config, **extra) if False else None
+            # Fallback: store and let caller set .model? Instead raise clear error.
+            raise ValueError("verified_schema(source=...) requires a model; use verified_schema_from_source(source, model)")
+        return VerifiedSchema(None, source=source, model=model, **config, **extra)
     if callable(func) and not isinstance(func, type):
         return decorator(func)
     if func is not None:
-        # allow positional call with func passed? fallback
         return decorator(func)
     return decorator
+
+
+def verified_schema_from_source(source: str, model, **config):
+    """Build a :class:`VerifiedSchema` from a source string (REPL/stdin/programmatic)."""
+    return VerifiedSchema(None, source=source, model=model, **config)
 
 
 # ---------- DSL primitives ----------

@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
 from .config import CodeEngineConfig
 from .contracts import build_contracts
@@ -223,7 +226,7 @@ class VexxCodeController(_Base):
             check_ast_policy(script_str)
         except (SyntaxError, PermissionError, ValueError) as exc:
             return f"EXP_ERROR: {exc}"
-        runner = SandboxRunner(self.config)
+        runner = SandboxRunner.from_config(self.config)
         combined = "\n".join([*self.experiment_preamble, script_str])
         if self.experiment_preamble:
             try:

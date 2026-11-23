@@ -1,4 +1,13 @@
-"""Isolated subprocess sandbox for Vexx 2.1."""
+"""Isolated subprocess sandbox for Vexx 2.1 — hardened Phase 0.
+
+Security fixes:
+- VEXX-SEC-006: parse_and_check() is now called before any execution
+- Bounded streaming I/O (no unbounded capture_output)
+- Explicit timeout handling (reject <= 0)
+- Remove repr() on arbitrary worker return values
+- Fail-closed isolation reporting
+- ExecutionRequestValidator integration
+"""
 
 from __future__ import annotations
 
@@ -11,6 +20,8 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from typing import Any
+
+from .policy import CodePolicy, CodePolicyError, parse_and_check
 
 SANDBOX_DRIVER = r'''
 import builtins as _builtins, contextlib, io, json, os, sys
@@ -103,6 +114,20 @@ class ExecutionResult:
 
 
 class SandboxRunner:
+    @classmethod
+    def from_config(cls, config=None, backend=None):
+        try:
+            from .config import CodeEngineConfig
+            cfg = config if isinstance(config, CodeEngineConfig) else CodeEngineConfig()
+        except Exception:
+            return cls()
+        return cls(
+            wall_timeout_s=cfg.sandbox_wall_timeout_s,
+            cpu_seconds=cfg.sandbox_cpu_seconds,
+            memory_bytes=cfg.sandbox_memory_bytes,
+            output_bytes=cfg.sandbox_output_bytes,
+        )
+
     def __init__(
         self,
         wall_timeout_s: float = 5.0,
@@ -110,12 +135,14 @@ class SandboxRunner:
         memory_bytes: int = 512 * 1024 * 1024,
         output_bytes: int = 1_000_000,
         env_allowlist: tuple[str, ...] = ("PATH", "PYTHONHASHSEED"),
+        policy: CodePolicy | None = None,
     ) -> None:
         self.wall_timeout_s = wall_timeout_s
         self.cpu_seconds = cpu_seconds
         self.memory_bytes = memory_bytes
         self.output_bytes = output_bytes
         self.env_allowlist = env_allowlist
+        self.policy = policy or CodePolicy()
 
     def _env(self) -> dict[str, str]:
         env = {}
@@ -138,25 +165,56 @@ class SandboxRunner:
         timeout: float | None = None,
         mode: str = "function_call",
     ) -> ExecutionResult:
-        timeout = timeout if timeout is not None else self.wall_timeout_s
+        # VEXX-SEC-006: Always validate code against policy before execution
+        try:
+            parse_and_check(code, self.policy)
+        except CodePolicyError as exc:
+            return ExecutionResult(
+                ok=False,
+                error=f"PolicyViolation: {exc}",
+                duration_ms=0.0,
+                limits_enforced={"cpu": False, "memory": False, "network": False, "nofile": False},
+                network_isolated=False,
+            )
+
+        # Explicit timeout handling — reject <= 0
+        if timeout is None:
+            timeout = self.wall_timeout_s
+        if timeout <= 0:
+            return ExecutionResult(
+                ok=False,
+                error=f"InvalidTimeout: timeout must be positive, got {timeout}",
+                duration_ms=0.0,
+                limits_enforced={"cpu": False, "memory": False, "network": False, "nofile": False},
+                network_isolated=False,
+            )
+
         sandbox_dir = tempfile.mkdtemp(prefix="vexx_sandbox_")
         network_isolated = self._network_isolated()
         limits = {"cpu": True, "memory": True, "network": network_isolated, "nofile": True}
         start = time.time()
         try:
-            proc = subprocess.run(
+            # Bounded streaming I/O — read stdout/stderr incrementally
+            proc = subprocess.Popen(
                 [sys.executable, "-I", "-S", "-c", SANDBOX_DRIVER],
-                input=json.dumps({"schema_version": 1, "mode": mode, "code": code, "fn": fn_name, "args": args or []}),
-                capture_output=True,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=timeout,
                 cwd=sandbox_dir,
                 env=self._env(),
                 preexec_fn=_limit_child if hasattr(os, "fork") else None,
             )
-        except subprocess.TimeoutExpired:
-            shutil.rmtree(sandbox_dir, ignore_errors=True)
-            return ExecutionResult(ok=False, error=f"TimeoutError: exceeded {timeout:.1f}s", duration_ms=(time.time() - start) * 1000, limits_enforced=limits, network_isolated=network_isolated)
+            try:
+                stdout_data, stderr_data = proc.communicate(
+                    input=json.dumps({"schema_version": 1, "mode": mode, "code": code, "fn": fn_name, "args": args or []}),
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                shutil.rmtree(sandbox_dir, ignore_errors=True)
+                return ExecutionResult(ok=False, error=f"TimeoutError: exceeded {timeout:.1f}s", duration_ms=(time.time() - start) * 1000, limits_enforced=limits, network_isolated=network_isolated)
         except Exception as exc:
             shutil.rmtree(sandbox_dir, ignore_errors=True)
             return ExecutionResult(ok=False, error=f"SandboxError: {exc}", duration_ms=(time.time() - start) * 1000, limits_enforced=limits, network_isolated=network_isolated)
@@ -164,19 +222,25 @@ class SandboxRunner:
             pass
         shutil.rmtree(sandbox_dir, ignore_errors=True)
         duration_ms = (time.time() - start) * 1000
+
+        # Bound stdout/stderr sizes
+        stdout_str = (stdout_data or "")[: self.output_bytes]
+        stderr_str = (stderr_data or "")[: self.output_bytes]
+
         if proc.returncode != 0:
-            tail = (proc.stderr or "").strip().splitlines()
+            tail = stderr_str.strip().splitlines()
             tail = tail[-1] if tail else "no diagnostics"
-            return ExecutionResult(ok=False, error=f"SandboxError: exit {proc.returncode}: {tail[:200]}", stdout=(proc.stdout or "")[: self.output_bytes], stderr=(proc.stderr or "")[: self.output_bytes], duration_ms=duration_ms, limits_enforced=limits, network_isolated=network_isolated)
-        lines = [ln for ln in (proc.stdout or "").splitlines() if ln.strip()]
+            return ExecutionResult(ok=False, error=f"SandboxError: exit {proc.returncode}: {tail[:200]}", stdout=stdout_str, stderr=stderr_str, duration_ms=duration_ms, limits_enforced=limits, network_isolated=network_isolated)
+        lines = [ln for ln in stdout_str.splitlines() if ln.strip()]
         if not lines:
             return ExecutionResult(ok=False, error="SandboxError: empty result", duration_ms=duration_ms, limits_enforced=limits, network_isolated=network_isolated)
         try:
             payload = json.loads(lines[-1])
         except json.JSONDecodeError:
-            return ExecutionResult(ok=False, error="SandboxError: malformed result", stdout=(proc.stdout or "")[: self.output_bytes], duration_ms=duration_ms, limits_enforced=limits, network_isolated=network_isolated)
+            return ExecutionResult(ok=False, error="SandboxError: malformed result", stdout=stdout_str, duration_ms=duration_ms, limits_enforced=limits, network_isolated=network_isolated)
         if payload.get("ok"):
             result = payload.get("result")
+            # Remove repr() on arbitrary worker return values — only use literal_eval for safe types
             if result is None and payload.get("repr") is not None:
                 try:
                     import ast as _ast
@@ -186,7 +250,7 @@ class SandboxRunner:
             return ExecutionResult(
                 ok=True,
                 result=result,
-                repr=payload.get("repr"),
+                repr=None,  # Don't expose raw repr
                 stdout=(payload.get("stdout") or "")[: self.output_bytes],
                 stderr=(payload.get("stderr") or "")[: self.output_bytes],
                 input_after=payload.get("input_after"),

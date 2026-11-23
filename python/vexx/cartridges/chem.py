@@ -190,6 +190,7 @@ class SmilesAnalysis:
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     formula: dict[str, int] = field(default_factory=dict)
+    allow_unknown_elements: bool = False
 
     @property
     def ok(self) -> bool:
@@ -303,8 +304,9 @@ def _bracket_atom(index: int, text: str) -> Atom:
     )
 
 
-def analyze_smiles(smiles: str) -> SmilesAnalysis:
+def analyze_smiles(smiles: str, *, allow_unknown_elements: bool = False) -> SmilesAnalysis:
     analysis = SmilesAnalysis()
+    analysis.allow_unknown_elements = bool(allow_unknown_elements)
     if not isinstance(smiles, str) or not smiles.strip():
         analysis.errors.append("empty SMILES")
         return analysis
@@ -408,7 +410,10 @@ def _finish_atom(analysis: SmilesAnalysis, atom: Atom) -> None:
     allowed = _allowed(atom)
     if not allowed:
         if atom.bracket:
-            analysis.warnings.append(f"unknown element {atom.symbol!r}; valence unchecked")
+            if analysis.allow_unknown_elements:
+                analysis.warnings.append(f"unknown element {atom.symbol!r}; valence unchecked")
+            else:
+                analysis.errors.append(f"unknown element {atom.symbol!r}")
         return
     if atom.bracket:
         total = atom.bond_sum + atom.explicit_h
@@ -461,8 +466,8 @@ def valence_ok(symbol: str, bonds: float, charge: int = 0) -> bool:
     return bonds in {max(0, value + charge) for value in base}
 
 
-def smiles_valence_ok(smiles: str) -> bool:
-    return analyze_smiles(smiles).ok
+def smiles_valence_ok(smiles: str, *, allow_unknown_elements: bool = False) -> bool:
+    return analyze_smiles(smiles, allow_unknown_elements=allow_unknown_elements).ok
 
 
 def formal_charge_neutral(charges: Sequence[int]) -> bool:

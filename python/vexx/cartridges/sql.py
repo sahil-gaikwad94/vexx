@@ -155,7 +155,7 @@ class SqlVerifier:
             import sqlglot
             from sqlglot import expressions as exp
         except Exception:
-            return SqlVerification(False, ["sqlglot is required for SQL verification; install vexx-ai[sql]"])
+            return SqlVerification(False, ["sqlglot is required for SQL verification; install vexx-ai (sqlglot is a core dependency)"])
         try:
             statements = sqlglot.parse(sql)
         except Exception as exc:

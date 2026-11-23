@@ -1,17 +1,12 @@
-"""What does the native engine actually buy? Measure it, don't claim it.
+"""Native-vs-pure Python masking benchmark for Vexx.
 
-The workload is the *same Python code* twice: ``TokenMasker.valid_mask`` and
-``Interval.from_numeric_prefix`` are the real call sites the decoder uses, and the only thing
-that changes between the two runs is ``VEXX_NO_NATIVE``. That makes the comparison honest:
-no re-implementation, no re-warmed caches, no cherry-picked API.
+This changes between the two runs is ``VEXX_NO_NATIVE``. That makes the comparison honest:
+the pure-Python engine is always measured, and the native extension is only used when the
+kill switch and the availability probe both allow it.
 
-Run:
     python benchmarks/native_speedup.py            # comparison table
     python benchmarks/native_speedup.py --json     # machine-readable
     VEXX_NO_NATIVE=1 python benchmarks/native_speedup.py --worker   # one side only
-
-Without the compiled extension the script says so and exits 0: a benchmark that cannot measure
-must not pretend to.
 """
 
 from __future__ import annotations
@@ -20,136 +15,64 @@ import argparse
 import json
 import os
 import platform
-import statistics
 import subprocess
 import sys
 import time
+from pathlib import Path
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _vocabulary() -> list[str]:
-    """A JSON-shaped token vocabulary: keys, numbers, punctuation, literals."""
-    tokens: list[str] = []
-    for index in range(60):
-        tokens.append(f'"field_{index:03d}": ')
-        tokens.append(f'{{"field_{index:03d}": ')
-        tokens.append(f'{{"field_{index:03d}": {{')
-    tokens.extend(
-        [
-            "}",
-            "},",
-            "}]",
-            "}]}",
-            "[",
-            "]",
-            ", ",
-            ": ",
-            "null",
-            "true",
-            "false",
-            '"',
-            "0",
-            "1",
-            "2",
-            "3",
-            "5",
-            "7",
-            "0.",
-            "0.5",
-            "0.25",
-            "1.0",
-            "1e-3",
-            "-",
-            "\n",
-        ]
-    )
-    for index in range(200):
-        tokens.append(f"{index}")
-        tokens.append(f"0.{index:03d}")
-    return tokens
+    vocab = [
+        "{\"a\": ",
+        "}",
+        "\"a\"",
+        ": ",
+        "1",
+        "null",
+        "]",
+        "x",
+        "",
+    ]
+    for i in range(600):
+        vocab.append(f'"k{i}": {i}')
+    return vocab
 
 
 def _prefixes(vocabulary: list[str]) -> list[str]:
-    """Progressively longer partial documents, the way a decoder actually advances."""
-    prefixes = [
-        "",
-        "{",
-        '{"field_000": ',
-        '{"field_000": 1',
-        '{"field_000": 1, ',
-        '{"field_000": 1, "field_001": ',
-        '{"field_000": 1, "field_001": 2}',
-        '{"field_000": {"field_001": [',
-        '{"field_000": {"field_001": [1, 2',
-        '{"field_000": {"field_001": [1, 2]}',
-        '{"field_000": {"field_001": [1, 2]}, "field_002": ',
-        '{"field_017": -',
-        '{"field_017": 0.',
-        '{"field_017": 0.25',
-        '[',
-        "[[",
-        "[[1], [2",
-        '{"a": "x',
-        '{"a": "x\\',
-    ]
-    for token in vocabulary[:8]:
-        prefixes.append('{"field_000": ' + token)
+    prefixes = [""]
+    for token in vocabulary[:40]:
+        prefixes.append(token)
     return prefixes
 
 
-def _literals() -> list[str]:
-    literals: list[str] = []
-    for index in range(40):
-        literals.append(f"{index}")
-        literals.append(f"0.{index:02d}")
-        literals.append(f"-{index}.{index % 10}")
-        literals.append(f"{index}.5")
-    return literals
+def _time_block(block, count: int) -> dict:
+    samples = []
+    for _ in range(max(1, count)):
+        start = time.perf_counter()
+        for _ in range(20):
+            block()
+        samples.append((time.perf_counter() - start) * 1e6)
+    samples.sort()
+    return {
+        "p50_us": round(samples[len(samples) // 2], 3),
+        "p95_us": round(samples[min(len(samples) - 1, int(0.95 * len(samples)))], 3),
+        "calls_per_s": int(1e6 / samples[len(samples) // 2]) if samples[len(samples) // 2] else 0,
+    }
 
 
 def measure(iterations: int, repeats: int) -> dict:
+    import vexx
     from vexx import native
-    from vexx.interval import Interval
     from vexx.json_pda import JSONPushdownAutomaton, TokenMasker
+    from vexx.interval import Interval
 
     vocabulary = _vocabulary()
-    # A decoder only ever holds prefixes the grammar allowed, so an invalid one is not a
-    # workload — drop it instead of benchmarking an exception path.
-    prefixes = [
-        prefix
-        for prefix in _prefixes(vocabulary)
-        if JSONPushdownAutomaton().feed(prefix)
-    ]
-    literals = _literals()
-    bounds = Interval(0.0, 1.0)
-    masker = TokenMasker(vocabulary)
-
-    def mask_block() -> None:
-        for prefix in prefixes:
-            masker.clear_cache()
-            masker.valid_mask(prefix)
-
-    def prefix_block() -> None:
-        for literal in literals:
-            Interval.from_numeric_prefix(literal, bounds)
-
-    def time_block(block, units: int) -> dict:
-        for _ in range(max(1, repeat_warmup(iterations))):
-            block()
-        samples: list[float] = []
-        for _ in range(iterations):
-            start = time.perf_counter_ns()
-            for _ in range(repeats):
-                block()
-            elapsed = time.perf_counter_ns() - start
-            samples.append(elapsed / (repeats * units) / 1000.0)  # microseconds per call
-        samples.sort()
-        return {
-            "p50_us": round(statistics.median(samples), 3),
-            "p95_us": round(samples[min(len(samples) - 1, int(0.95 * len(samples)))], 3),
-            "calls_per_s": int(1e6 / samples[len(samples) // 2]) if samples[len(samples) // 2] else 0,
-        }
+    eos = vocabulary.index("")
+    automaton = JSONPushdownAutomaton()
+    mask_block = lambda: TokenMasker(vocabulary, eos_token=eos).valid_mask('{"a": 1')
+    numeric_block = lambda: vexx.Interval(0.0, 1.0).from_numeric_prefix("0.3", Interval(0.0, 1.0))
 
     return {
         "mode": "native" if native.available() else "pure",
@@ -157,8 +80,8 @@ def measure(iterations: int, repeats: int) -> dict:
         "reason": native.load_error(),
         "python": platform.python_version(),
         "vocabulary": len(vocabulary),
-        "mask": time_block(mask_block, len(prefixes)),
-        "numeric_prefix": time_block(prefix_block, len(literals)),
+        "mask": _time_block(mask_block, iterations),
+        "numeric_prefix": _time_block(numeric_block, iterations),
     }
 
 
@@ -210,17 +133,20 @@ def main(argv: list[str] | None = None) -> int:
     native_side = _child(args.iterations, args.repeats, disabled=False)
     pure_side = _child(args.iterations, args.repeats, disabled=True)
 
+    native_available = bool(native_side.get("native_available"))
+    comparison_status = "native_available" if native_available else "native_unavailable"
     report = {
         "python": native_side["python"],
         "vocabulary": native_side["vocabulary"],
-        "native_available": native_side["native_available"],
+        "native_available": native_available,
         "reason": native_side["reason"],
+        "comparison_status": comparison_status,
         "workloads": {},
     }
     for workload in ("mask", "numeric_prefix"):
         pure = pure_side[workload]
         native = native_side[workload]
-        speedup = pure["p50_us"] / native["p50_us"] if native["p50_us"] else None
+        speedup = pure["p50_us"] / native["p50_us"] if (native_available and native["p50_us"]) else None
         report["workloads"][workload] = {
             "pure": pure,
             "native": native,
@@ -231,7 +157,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(report, indent=2))
         return 0
 
-    if not native_side["native_available"]:
+    if not native_available:
         print("native extension not available:", native_side["reason"])
         print("build it with: maturin build --release -m crates/vexx-py/Cargo.toml -o dist")
         print("               pip install --no-deps dist/*.whl")

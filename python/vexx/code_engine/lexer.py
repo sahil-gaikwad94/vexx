@@ -344,6 +344,10 @@ def _scan_chars(st: LexerState, text: str, limit: int) -> int:
 
         # ------------------------------------------------- ordinary string
         if st.in_str is not None:
+            if ch == "\n" and not st.raw_str and isinstance(st.in_str, str) and len(st.in_str) == 1:
+                st.valid = False
+                st.reason = "unterminated_string_literal"
+                break
             if ch == "\\" and i + 1 < n:
                 i += 2
                 continue

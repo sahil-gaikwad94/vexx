@@ -846,6 +846,29 @@ def verify_certificate(
     )
 
 
+def _canonical_witness(values: Mapping[str, Any], report: Any = None) -> dict[str, Any]:
+    """Return a witness whose set/dict ordering is canonical for digest + SMT rendering."""
+
+    def _canon(value):
+        if isinstance(value, (set, frozenset)):
+            items = sorted((_canon(v) for v in value), key=repr)
+            return {"__set__": items}
+        if isinstance(value, dict):
+            pairs = sorted(
+                ((_canon(k), _canon(v)) for k, v in value.items()),
+                key=lambda kv: repr(kv[0]),
+            )
+            return {"__pairs__": [[k, v] for k, v in pairs]}
+        if isinstance(value, (list, tuple)):
+            return [_canon(v) for v in value]
+        return value
+
+    out: dict[str, Any] = {}
+    for key, value in values.items():
+        out[str(key)] = _canon(value)
+    return out
+
+
 def build_certificate(
     schema_or_spec: Any,
     values: Mapping[str, Any],
@@ -858,9 +881,12 @@ def build_certificate(
 
     spec = _coerce_spec(schema_or_spec)
     report = verify_values(spec, dict(values), derive_missing=True)
+    # Canonicalize the witness so a freshly built certificate round-trips through its
+    # own digest / SMT binding without set/dict ordering divergence.
     if require_valid and report.status != "PASS":
         raise VerificationError(report)
-    witness = dict(report.values if report.status == "PASS" else values)
+    witness_source = report.values if report.status == "PASS" else dict(values)
+    witness = _canonical_witness(dict(witness_source), report)
     if extra_fields:
         witness.update(dict(extra_fields))
     smt2, coverage = render_smt2_with_coverage(spec, witness)

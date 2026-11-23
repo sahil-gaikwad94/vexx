@@ -31,6 +31,17 @@ class Interval:
             self.lo = float("-inf")
         if self.hi is None:
             self.hi = float("inf")
+        if isinstance(self.lo, bool) or isinstance(self.hi, bool):
+            raise TypeError("bounds must be numbers")
+        try:
+            lo_f = float(self.lo)
+            hi_f = float(self.hi)
+        except (TypeError, ValueError):
+            raise ValueError("bounds must be numeric")
+        if math.isnan(lo_f) or math.isnan(hi_f):
+            raise ValueError("Interval bounds must not be NaN")
+        self.lo = lo_f
+        self.hi = hi_f
         # normalize empty
         if self.lo > self.hi:
             # keep as given; is_empty handles
@@ -156,17 +167,31 @@ class Interval:
             return domain_bounds.intersect(Interval(0.0, float("inf")))
 
         is_neg = num_part.startswith("-")
+        # Reject leading-zero integer prefixes like "00", "-00", "01".
+        _digits = num_part.lstrip("-").lstrip("+")
+        if "." not in _digits and "e" not in _digits.lower() and len(_digits) > 1 and _digits.startswith("0") and _digits.isdigit():
+            return Interval.empty()
         # strip a single trailing dot
         clean = num_part[:-1] if num_part.endswith(".") else num_part
         try:
             base_val = float(clean)
         except (ValueError, TypeError):
             return Interval.empty()
+        if not math.isfinite(base_val):
+            return Interval.empty()
 
         if is_closed:
             return domain_bounds.intersect(Interval(base_val, base_val))
 
         if allow_exp and ("e" in num_part.lower() or "E" in num_part):
+            # If the parsed value already falls outside the domain, the prefix cannot
+            # complete to any in-domain value.
+            try:
+                _pt = Interval(base_val, base_val)
+            except Exception:
+                _pt = Interval.empty()
+            if _pt.intersect(domain_bounds).is_empty():
+                return Interval.empty()
             return Interval(domain_bounds.lo, domain_bounds.hi)
 
         # decimal point present

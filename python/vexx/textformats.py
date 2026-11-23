@@ -63,11 +63,21 @@ def is_supported(fmt: str | None) -> bool:
     return bool(fmt) and str(fmt) in SUPPORTED_FORMATS
 
 
+def _rfc3339_tz_aware(text: str) -> bool:
+    s = str(text).strip()
+    if s.endswith("Z") or s.endswith("z"):
+        return True
+    import re as _re
+    return bool(_re.search(r"[+-]\d{2}:\d{2}$", s))
+
+
 def validate(fmt: str, text: str) -> bool | None:
     """``True``/``False`` when the format has a registered checker, else ``None``."""
 
     if not is_supported(fmt):
         return None
+    if fmt == "date-time" and not _rfc3339_tz_aware(text):
+        return False
     try:
         _checker().check(text, fmt)
         return True

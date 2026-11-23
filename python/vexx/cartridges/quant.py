@@ -323,17 +323,37 @@ def _norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
+def _bs_validate(S, K, r, sigma, T):
+    for name, val in (("S", S), ("K", K), ("T", T), ("sigma", sigma)):
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            raise ValueError(f"{name} must be a number")
+        if not math.isfinite(val):
+            raise ValueError(f"{name} must be finite")
+    if S < 0 or K < 0 or T < 0 or sigma < 0:
+        raise ValueError("S, K, T, sigma must be non-negative")
+    if not math.isfinite(r):
+        raise ValueError("r must be finite")
+
+
 def black_scholes_call(S: float, K: float, r: float, sigma: float, T: float) -> float:
-    if T <= 0 or sigma <= 0:
+    _bs_validate(S, K, r, sigma, T)
+    S = float(S); K = float(K); r = float(r); sigma = float(sigma); T = float(T)
+    if T <= 0:
         return max(0.0, S - K)
+    if sigma <= 0:
+        return max(0.0, S - K * math.exp(-r * T))
     d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
     d2 = d1 - sigma * math.sqrt(T)
     return S * _norm_cdf(d1) - K * math.exp(-r * T) * _norm_cdf(d2)
 
 
 def black_scholes_put(S: float, K: float, r: float, sigma: float, T: float) -> float:
-    if T <= 0 or sigma <= 0:
+    _bs_validate(S, K, r, sigma, T)
+    S = float(S); K = float(K); r = float(r); sigma = float(sigma); T = float(T)
+    if T <= 0:
         return max(0.0, K - S)
+    if sigma <= 0:
+        return max(0.0, K * math.exp(-r * T) - S)
     d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
     d2 = d1 - sigma * math.sqrt(T)
     return K * math.exp(-r * T) * _norm_cdf(-d2) - S * _norm_cdf(-d1)

@@ -76,6 +76,101 @@ class UntrustedString(str):
     def tag(self, source: str) -> UntrustedString:
         return UntrustedString(self, (*self.sources, source))
 
+    @staticmethod
+    def _union_sources(*values) -> frozenset[str]:
+        sources: set[str] = set()
+        for v in values:
+            if isinstance(v, UntrustedString):
+                sources |= set(v.sources)
+        return frozenset(sources) if sources else frozenset(("untrusted",))
+
+    def _wrap(self, value, *extra) -> UntrustedString:
+        srcs = set(self.sources)
+        for v in extra:
+            if isinstance(v, UntrustedString):
+                srcs |= set(v.sources)
+        if not srcs:
+            srcs = set(self.sources) or {"untrusted"}
+        return UntrustedString(str(value), frozenset(srcs))
+
+    def __add__(self, other):
+        srcs = set(self.sources)
+        if isinstance(other, UntrustedString):
+            srcs |= set(other.sources)
+        return UntrustedString(str(self) + str(other), frozenset(srcs) or {"untrusted"})
+
+    def __radd__(self, other):
+        srcs = set(self.sources)
+        if isinstance(other, UntrustedString):
+            srcs |= set(other.sources)
+        return UntrustedString(str(other) + str(self), frozenset(srcs) or {"untrusted"})
+
+    def __getitem__(self, key):
+        base = str(self)[key]
+        if isinstance(key, slice):
+            return UntrustedString(str(base), self.sources)
+        return UntrustedString(str(base), self.sources)
+
+    def __mod__(self, other):
+        srcs = set(self.sources)
+        if isinstance(other, UntrustedString):
+            srcs |= set(other.sources)
+        try:
+            result = str(self) % other
+        except Exception:
+            result = str(self) % str(other)
+        return UntrustedString(str(result), frozenset(srcs) or {"untrusted"})
+
+    def __format__(self, format_spec=""):
+        return UntrustedString(format(str(self), format_spec), self.sources)
+
+    def format(self, *args, **kwargs):
+        srcs = set(self.sources)
+        for a in args:
+            if isinstance(a, UntrustedString):
+                srcs |= set(a.sources)
+        for v in kwargs.values():
+            if isinstance(v, UntrustedString):
+                srcs |= set(v.sources)
+        result = str(self).format(*args, **kwargs)
+        return UntrustedString(str(result), frozenset(srcs) or {"untrusted"})
+
+    def join(self, iterable):
+        items = list(iterable)
+        srcs = set(self.sources)
+        for it in items:
+            if isinstance(it, UntrustedString):
+                srcs |= set(it.sources)
+        result = str(self).join(str(x) for x in items)
+        return UntrustedString(str(result), frozenset(srcs) or {"untrusted"})
+
+    def strip(self, chars=None):
+        return UntrustedString(str(self).strip(chars), self.sources)
+
+    def lstrip(self, chars=None):
+        return UntrustedString(str(self).lstrip(chars), self.sources)
+
+    def rstrip(self, chars=None):
+        return UntrustedString(str(self).rstrip(chars), self.sources)
+
+    def lower(self):
+        return UntrustedString(str(self).lower(), self.sources)
+
+    def upper(self):
+        return UntrustedString(str(self).upper(), self.sources)
+
+    def replace(self, old, new, count=-1):
+        srcs = set(self.sources)
+        if isinstance(old, UntrustedString):
+            srcs |= set(old.sources)
+        if isinstance(new, UntrustedString):
+            srcs |= set(new.sources)
+        result = str(self).replace(str(old), str(new), count)
+        return UntrustedString(str(result), frozenset(srcs) or {"untrusted"})
+
+    def title(self):
+        return UntrustedString(str(self).title(), self.sources)
+
     @classmethod
     def __get_pydantic_core_schema__(cls, source: Any, handler: Any):
         from pydantic_core import core_schema
@@ -96,6 +191,26 @@ class UntrustedString(str):
 
 def taint(value: Any, sources: Sequence[str] | None = None) -> UntrustedString:
     return UntrustedString(str(value), sources)
+
+
+def safe_format(template: Any, *args: Any, **kwargs: Any) -> UntrustedString:
+    """Format ``template`` while preserving taint from any untrusted input.
+
+    Use this instead of f-strings / ``str.format`` when handling untrusted text.
+    """
+    srcs: set[str] = set()
+    if isinstance(template, UntrustedString):
+        srcs |= set(template.sources)
+    for a in args:
+        if isinstance(a, UntrustedString):
+            srcs |= set(a.sources)
+    for v in kwargs.values():
+        if isinstance(v, UntrustedString):
+            srcs |= set(v.sources)
+    result = str(template).format(*args, **kwargs)
+    if not srcs:
+        srcs = {"untrusted"} if isinstance(template, UntrustedString) else set()
+    return UntrustedString(str(result), frozenset(srcs) if srcs else frozenset())
 
 
 def _taint_map(mapping: Mapping[str, Any] | None, prefix: str = "") -> dict[str, frozenset[str]]:

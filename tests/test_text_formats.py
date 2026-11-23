@@ -156,7 +156,7 @@ def test_verify_instance_accepts_typed_model_values():
     verifying a real model instance failed as a *structural* error."""
 
     instance = Formatted(
-        ts=datetime(2024, 1, 2, 3, 4, 5, tzinfo=None),
+        ts=datetime(2024, 1, 2, 3, 4, 5, tzinfo=__import__("datetime").timezone.utc),
         day=date(2024, 1, 2),
         at=time(3, 4, 5),
         dur=timedelta(minutes=90),

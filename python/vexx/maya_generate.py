@@ -6,7 +6,10 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
 try:
     import torch

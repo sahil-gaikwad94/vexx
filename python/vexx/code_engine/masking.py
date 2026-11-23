@@ -12,7 +12,10 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
 from .config import CodeEngineConfig
 from .contracts import CallCheck, CallableContract, check_call

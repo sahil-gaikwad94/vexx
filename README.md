@@ -17,9 +17,9 @@ Pure Python reference engine with an optional dependency-free Rust accelerator
 [![PyPI version](https://img.shields.io/pypi/v/vexx-ai?label=PyPI&color=6366f1)](https://pypi.org/project/vexx-ai/)
 [![Python](https://img.shields.io/pypi/pyversions/vexx-ai?label=Python&color=a855f7)](https://pypi.org/project/vexx-ai/)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![CI](https://img.shields.io/github/actions/workflow/status/sahil-gaikwad94/vexx../ci.yml?label=CI)](https://github.com/sahil-gaikwad94/vexx../actions)
+[![CI](https://img.shields.io/github/actions/workflow/status/sahil-gaikwad94/vexx/ci.yml?label=CI)](https://github.com/sahil-gaikwad94/vexx/actions)
 [![Rust accelerator](https://img.shields.io/badge/native-Rust%20accelerator-059669)](docs/NATIVE.md)
-[![GitHub stars](https://img.shields.io/github/stars/sahil-gaikwad94/vexx..?style=social)](https://github.com/sahil-gaikwad94/vexx..)
+[![GitHub stars](https://img.shields.io/github/stars/sahil-gaikwad94/vexx?style=social)](https://github.com/sahil-gaikwad94/vexx)
 
 [Install](#install) • [Features](#features) • [Quick start](#quick-start) • [Examples](#examples) • [Architecture](#architecture) • [Docs](#docs)
 
@@ -137,8 +137,8 @@ Pure Python — no Rust toolchain required. Optional extras:
 Source-tree development without installation:
 
 ```bash
-git clone https://github.com/sahil-gaikwad94/vexx..git
-cd vexx..
+git clone https://github.com/sahil-gaikwad94/vexxgit
+cd vexx
 python -m venv .venv
 .venv/bin/pip install -e ".[dev]"
 PYTHONPATH=python .venv/bin/vexx --help
@@ -593,8 +593,8 @@ grammar tier is JSON, and token masking is exact but a Python reference implemen
 ## 🔗 Links
 
 - [PyPI: vexx-ai](https://pypi.org/project/vexx-ai/)
-- [GitHub repository](https://github.com/sahil-gaikwad94/vexx..)
-- [Issue tracker](https://github.com/sahil-gaikwad94/vexx../issues)
+- [GitHub repository](https://github.com/sahil-gaikwad94/vexx)
+- [Issue tracker](https://github.com/sahil-gaikwad94/vexx/issues)
 - [Native engine contract](docs/NATIVE.md)
 - [Benchmarks](docs/BENCHMARKS.md)
 - [Audit notes](docs/AUDIT.md)

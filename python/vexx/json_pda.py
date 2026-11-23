@@ -477,6 +477,8 @@ def _scalar_json(value):
     if isinstance(value, Enum):
         return json_value(value.value)
     if isinstance(value, datetime):
+        if value.tzinfo is None:
+            raise ValueError("naive datetime is not allowed; use a timezone-aware value (RFC 3339)")
         text = value.isoformat()
         return json.dumps(text[:-6] + "Z" if text.endswith("+00:00") else text)
     if isinstance(value, (date, time)):

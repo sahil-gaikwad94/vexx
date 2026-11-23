@@ -41,7 +41,52 @@ DEFAULT_FORBIDDEN_IDENTIFIERS: tuple[str, ...] = (
 DEFAULT_FORBIDDEN_NODES: tuple[str, ...] = ("Global",)
 
 #: Attribute names that would let code walk into the object graph.
-_FORBIDDEN_ATTRS = frozenset({"__globals__", "__builtins__", "__subclasses__", "__code__", "__class__"})
+_FORBIDDEN_ATTRS = frozenset({
+    "__globals__", "__builtins__", "__subclasses__", "__code__", "__class__",
+    "__dict__", "__mro__", "__bases__", "__loader__", "__spec__",
+    "__init__", "__new__", "__del__", "__class_getitem__",
+    "__reduce__", "__reduce_ex__", "__getstate__", "__setstate__",
+    "__getattribute__", "__setattr__", "__delattr__", "__getattr__",
+    "__instancecheck__", "__subclasscheck__", "__class_getitem__",
+    "__bases__", "__mro_entries__", "__set_name__",
+    "__get__", "__set__", "__delete__", "__objclass__",
+    "__func__", "__self__", "__closure__", "__code__", "__defaults__",
+    "__kwdefaults__", "__annotations__", "__globals__",
+    "__wrapped__", "__module__", "__doc__",
+    "__name__", "__qualname__", "__type_params__",
+    "__dict__", "__weakref__", "__slots__", "__prepare__",
+    "__set_name__", "__instancecheck__", "__subclasscheck__",
+    "__class_getitem__", "__getnewargs__", "__getnewargs_ex__",
+    "__sizeof__", "__dir__", "__class__",
+})
+
+#: Attribute names that expose frame/code introspection — must never be reachable.
+_FRAME_ATTRS = frozenset({
+    "gi_frame", "cr_frame", "ag_frame", "tb_frame",
+    "f_globals", "f_builtins", "f_locals", "f_back", "f_code",
+    "gi_code", "gi_yieldfrom", "cr_code", "cr_origin",
+    "ag_code", "ag_arg", "ag_locals", "ag_kwargs",
+    "tb_frame", "tb_next", "tb_lasti", "tb_lineno",
+    "gi_suspended", "cr_running", "cr_await",
+})
+
+#: Methods that must never be called on untrusted strings/templates.
+_FORBIDDEN_STRING_METHODS = frozenset({"format", "format_map", "vformat"})
+
+#: Attribute names that must never be referenced by generated code.
+_FORBIDDEN_IDENTIFIERS_EXT = frozenset({
+    "os", "sys", "subprocess", "socket", "shutil", "pathlib", "open",
+    "eval", "exec", "compile", "__import__", "globals", "locals",
+    "getattr", "setattr", "delattr", "vars", "input", "breakpoint",
+    "ctypes", "signal", "resource", "fcntl", "posix", "nt", "pwd",
+    "grp", "termios", "tty", "pty", "select", "selectors", "asyncio",
+    "threading", "multiprocessing", "concurrent", "queue", "socketserver",
+    "http", "urllib", "ftplib", "smtplib", "telnetlib", "xmlrpc",
+    "pickle", "shelve", "marshal", "dbm", "sqlite3",
+    "importlib", "pkgutil", "modulefinder", "runpy", "pdb",
+    "gc", "weakref", "weakrefproxy", "atexit", "signal",
+    "copyreg", "reprlib", "enum", "graphlib", "heapq",
+})
 
 
 class CodePolicyError(PermissionError):
@@ -178,6 +223,34 @@ def check_ast_policy(source: str, policy: CodePolicy | None = None) -> ast.Modul
                     node="Attribute",
                     line=node.lineno,
                 )
+            if node.attr in _FRAME_ATTRS:
+                raise CodePolicyError(
+                    f"forbidden frame/introspection attribute: {node.attr}",
+                    node="Attribute",
+                    line=node.lineno,
+                )
+        if isinstance(node, ast.Call):
+            # Block str.format / str.format_map on untrusted strings/templates.
+            func = node.func
+            if isinstance(func, ast.Attribute):
+                if func.attr in _FORBIDDEN_STRING_METHODS:
+                    raise CodePolicyError(
+                        f"forbidden string method: {func.attr}",
+                        node="Call",
+                        line=node.lineno,
+                    )
+            elif isinstance(func, ast.Name) and func.id in _FORBIDDEN_IDENTIFIERS_EXT:
+                raise CodePolicyError(
+                    f"forbidden identifier: {func.id}",
+                    node="Name",
+                    line=node.lineno,
+                )
+        if isinstance(node, ast.Name) and node.id in _FORBIDDEN_IDENTIFIERS_EXT:
+            raise CodePolicyError(
+                f"forbidden identifier: {node.id}",
+                node="Name",
+                line=node.lineno,
+            )
     return tree
 
 
