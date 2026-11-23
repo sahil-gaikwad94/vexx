@@ -32,7 +32,6 @@ __all__ = [
     "CALLEE_KEYWORDS",
     "SAFE_STANDARD_METHODS",
     "FORBIDDEN_IDENTIFIERS",
-    "FORBIDDEN_AST_NODES",
     "iter_lexer_tokens",
 ]
 

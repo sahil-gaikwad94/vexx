@@ -65,14 +65,16 @@ def _time_block(block, count: int) -> dict:
 def measure(iterations: int, repeats: int) -> dict:
     import vexx
     from vexx import native
-    from vexx.json_pda import JSONPushdownAutomaton, TokenMasker
     from vexx.interval import Interval
+    from vexx.json_pda import JSONPushdownAutomaton, TokenMasker
 
     vocabulary = _vocabulary()
     eos = vocabulary.index("")
-    automaton = JSONPushdownAutomaton()
-    mask_block = lambda: TokenMasker(vocabulary, eos_token=eos).valid_mask('{"a": 1')
-    numeric_block = lambda: vexx.Interval(0.0, 1.0).from_numeric_prefix("0.3", Interval(0.0, 1.0))
+    JSONPushdownAutomaton()
+    def mask_block():
+        return TokenMasker(vocabulary, eos_token=eos).valid_mask('{"a": 1')
+    def numeric_block():
+        return vexx.Interval(0.0, 1.0).from_numeric_prefix("0.3", Interval(0.0, 1.0))
 
     return {
         "mode": "native" if native.available() else "pure",

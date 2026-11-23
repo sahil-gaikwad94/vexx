@@ -337,7 +337,11 @@ def _bs_validate(S, K, r, sigma, T):
 
 def black_scholes_call(S: float, K: float, r: float, sigma: float, T: float) -> float:
     _bs_validate(S, K, r, sigma, T)
-    S = float(S); K = float(K); r = float(r); sigma = float(sigma); T = float(T)
+    S = float(S)
+    K = float(K)
+    r = float(r)
+    sigma = float(sigma)
+    T = float(T)
     if T <= 0:
         return max(0.0, S - K)
     if sigma <= 0:
@@ -349,7 +353,11 @@ def black_scholes_call(S: float, K: float, r: float, sigma: float, T: float) -> 
 
 def black_scholes_put(S: float, K: float, r: float, sigma: float, T: float) -> float:
     _bs_validate(S, K, r, sigma, T)
-    S = float(S); K = float(K); r = float(r); sigma = float(sigma); T = float(T)
+    S = float(S)
+    K = float(K)
+    r = float(r)
+    sigma = float(sigma)
+    T = float(T)
     if T <= 0:
         return max(0.0, K - S)
     if sigma <= 0:

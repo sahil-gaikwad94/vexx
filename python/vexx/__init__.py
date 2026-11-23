@@ -22,8 +22,31 @@ __version__ = "2.1.0"
 
 # --- authoring layer -------------------------------------------------------
 # --- tier 0 / 1 / 2 engines ----------------------------------------------
+import warnings as _warnings
+
 from . import mcp
+from .bridges.code_hf import VexxCodeLogitsProcessor
+from .cache_protocol import (
+    RewindableCache,
+    clone_cache_generic,
+    create_empty_hybrid_cache_v2,
+    truncate_cache_at_token,
+)
+from .calibration import (
+    Diagnostic,
+    parse_unit_dimensions,
+    verify_epistemic_calibration,
+    verify_statistical_report,
+)
 from .cartridges.sec import WorldState
+from .cas import (
+    OptionalDependencyError,
+    crane_cas_evaluate,
+    integrate_definite,
+    modular_pow,
+    safe_sympy,
+    solve_linear_system,
+)
 
 # --- jump-forward / backtracking -----------------------------------------
 from .cdcl_jumpback import (
@@ -32,6 +55,29 @@ from .cdcl_jumpback import (
     ConflictBranchRecord,
     TabuPrefixTrie,
 )
+
+# --- Vexx 2.1 code engine -------------------------------------------------
+from .code_engine import (
+    CodeEngineConfig,
+    CodeSession,
+    LexerState,
+    VexxCodeController,
+    advance_lexer_state,
+)
+from .code_engine.candidate import CandidateReport, CandidateVerifier
+from .code_engine.conflict import BoundCut, CodeCheckpoint, contract_single_row
+from .code_engine.contracts import (
+    UNKNOWN_DYNAMIC_DISPATCH,
+    CallableContract,
+    CallCheck,
+    ParameterContract,
+    build_contracts,
+    check_call,
+    extract_ast_symbol_table,
+    header_contract_from_text,
+)
+from .code_engine.experiments import ExperimentEpisode, ExperimentResult
+from .code_engine.sandbox import ExecutionResult, SandboxRunner
 from .compiler.analysis import analyze_containers, container_for_name
 from .compiler.ast_transpiler import AstTranspiler, TranspileError
 from .compiler.dependency_graph import DependencyGraph
@@ -149,6 +195,11 @@ from .proof.certificate import (
     render_smt2,
     verify_certificate,
 )
+from .rl.code_rewards import (
+    compute_code_rewards,
+    execution_reward,
+    export_code_preferences,
+)
 from .rl.collector import (
     StepRecord,
     VexxRLCollector,
@@ -165,59 +216,6 @@ from .token_healer import (
     TokenizerProtocol,
 )
 from .zero_dof import ZeroDofEngine
-
-# --- Vexx 2.1 code engine -------------------------------------------------
-from .code_engine import (
-    CodeEngineConfig,
-    VexxCodeController,
-    CodeSession,
-    LexerState,
-    advance_lexer_state,
-)
-from .code_engine.contracts import (
-    ParameterContract,
-    CallableContract,
-    CallCheck,
-    build_contracts,
-    header_contract_from_text,
-    check_call,
-    extract_ast_symbol_table,
-    UNKNOWN_DYNAMIC_DISPATCH,
-)
-from .code_engine.masking import DeadEnd
-from .cas import (
-    safe_sympy,
-    crane_cas_evaluate,
-    solve_linear_system,
-    integrate_definite,
-    modular_pow,
-    OptionalDependencyError,
-)
-from .calibration import (
-    Diagnostic,
-    parse_unit_dimensions,
-    verify_statistical_report,
-    verify_epistemic_calibration,
-)
-from .cache_protocol import (
-    RewindableCache,
-    clone_cache_generic,
-    create_empty_hybrid_cache_v2,
-    truncate_cache_at_token,
-)
-from .code_engine.conflict import CodeCheckpoint, BoundCut, contract_single_row
-from .code_engine.sandbox import SandboxRunner, ExecutionResult
-from .code_engine.candidate import CandidateReport, CandidateVerifier
-from .maya_generate import generate_maya, GenerationResult, PLAIN, PYTHON, JSON, THINK
-from .code_engine.experiments import ExperimentEpisode, ExperimentResult
-from .rl.code_rewards import (
-    compute_code_rewards,
-    export_code_preferences,
-    execution_reward,
-)
-from .bridges.code_hf import VexxCodeLogitsProcessor
-
-import warnings as _warnings
 
 
 class _DeprecatedAlias(VexxCodeController):

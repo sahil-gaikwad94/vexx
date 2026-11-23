@@ -15,7 +15,7 @@ verdict is independent of how the text was chunked.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 
 __all__ = [
     "ProtocolConfig",
@@ -26,7 +26,7 @@ __all__ = [
 ]
 
 
-class ProtocolPhase(str, Enum):
+class ProtocolPhase(StrEnum):
     """Where the model is in the CRANE protocol."""
 
     #: Outside any span.  Host-authorized output is expected here.

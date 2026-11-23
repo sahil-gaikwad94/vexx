@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import hashlib
 import threading
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any
 
 try:
     import numpy as np
@@ -18,9 +19,7 @@ except ImportError:
     np = None
 
 from .config import CodeEngineConfig
-from .contracts import CallCheck, CallableContract, check_call
 from .lexer import LexerState, advance_lexer_state
-from .policy import CodePolicy, check_ast_policy
 from .protocol import ProtocolConfig, ProtocolPhase, ProtocolTracker
 
 
@@ -181,9 +180,7 @@ class CodeSession:
         self._refresh_symbols()
 
     def _refresh_symbols(self) -> None:
-        from .contracts import build_contracts, header_contract_from_text
         # We re-extract from a bounded tail; full definitions are preserved via accumulated.
-        window = self.config.signature_scan_window
         # Use the full active code if available; here we only have lexer state.
         # Symbol extraction is driven by masking.py which passes active_code.
         pass
@@ -282,8 +279,8 @@ _SAFE_STANDARD_METHODS = frozenset({
     "issuperset", "items", "keys", "pop", "popleft", "popitem", "remove",
     "reverse", "rotate", "setdefault", "sort", "symmetric_difference",
     "symmetric_difference_update", "union", "update", "values",
-    "capitalize", "casefold", "center", "count", "endswith", "expandtabs",
-    "find", "index", "isalnum", "isalpha", "isascii", "isdecimal", "isdigit",
+    "capitalize", "casefold", "center", "endswith", "expandtabs",
+    "find", "isalnum", "isalpha", "isascii", "isdecimal", "isdigit",
     "isidentifier", "islower", "isnumeric", "isprintable", "isspace", "istitle",
     "isupper", "join", "ljust", "lower", "lstrip", "partition", "removeprefix",
     "removesuffix", "replace", "rfind", "rindex", "rjust", "rpartition", "rsplit",

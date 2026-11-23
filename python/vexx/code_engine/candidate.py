@@ -121,7 +121,6 @@ class CandidateVerifier:
         passed = 0
         errors: list[str] = []
         mutation_free = True
-        start = 0.0
         import time
         t0 = time.time()
         if syntax_ok and policy_ok:

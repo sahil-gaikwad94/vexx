@@ -36,8 +36,8 @@ class Interval:
         try:
             lo_f = float(self.lo)
             hi_f = float(self.hi)
-        except (TypeError, ValueError):
-            raise ValueError("bounds must be numeric")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("bounds must be numeric") from exc
         if math.isnan(lo_f) or math.isnan(hi_f):
             raise ValueError("Interval bounds must not be NaN")
         self.lo = lo_f

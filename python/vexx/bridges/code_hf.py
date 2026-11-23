@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from typing import Any
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
-from ..code_engine.config import CodeEngineConfig
 from ..code_engine.controller import VexxCodeController
 from ..code_engine.masking import CodeSession
 

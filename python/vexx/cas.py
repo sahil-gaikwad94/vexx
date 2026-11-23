@@ -88,7 +88,7 @@ def _allowed_binops() -> dict[type, Any]:
     global _ALLOWED_BINOPS
     if _ALLOWED_BINOPS is not None:
         return _ALLOWED_BINOPS
-    sp = _sympy()
+    _sympy()
     _ALLOWED_BINOPS = {
         ast.Add: lambda a, b: a + b,
         ast.Sub: lambda a, b: a - b,
