@@ -77,7 +77,7 @@ jobs:
             # ``vexx_py`` extension module, while ``PYTHONPATH=python`` provides the pure
             # Python package (pip would otherwise uninstall one as a rename of the other).
             python -m venv /tmp/native-venv
-            /tmp/native-venv/bin/python -m pip install --upgrade pip pytest pydantic jsonschema hypothesis sqlglot
+            /tmp/native-venv/bin/python -m pip install --upgrade pip pytest pydantic jsonschema hypothesis sqlglot numpy
             /tmp/native-venv/bin/python -m pip install --no-deps dist/*.whl
             PYTHONPATH="$PWD/python" /tmp/native-venv/bin/python -c "import vexx, vexx.native as n; assert n.available(), n.load_error(); print(vexx.doctor())"
             # With vexx_py importable this runs the whole suite *through* the native
