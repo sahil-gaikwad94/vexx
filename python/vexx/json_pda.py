@@ -10,6 +10,16 @@ from dataclasses import dataclass
 from typing import Any
 
 _NUMBER_RE = re.compile(r"^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?$")
+#: Every string that is a *prefix* of the JSON number grammar.  The fraction (when present)
+#: must already hold a digit, so ``1.e`` is dead rather than merely incomplete: no completion
+#: of it is a number.  The exponent may still be empty or a bare sign (``1e``, ``1e-``).
+_NUMBER_STEP_RE = re.compile(r"^-?(?:0|[1-9][0-9]*)(?:[.][0-9]+)?(?:[eE][+-]?[0-9]*)?$")
+#: A trailing decimal point is a legal prefix of ``1.5`` even though it is not a step match.
+_NUMBER_TRAILING_DOT_RE = re.compile(r"^-?(?:0|[1-9][0-9]*)[.]$")
+#: A stepping number whose exponent is already written out; it must stay finite because
+#: ``parse_json`` rejects non-finite values.  Extra exponent digits only grow the magnitude,
+#: so an overflowing one can never be rescued by a later token.
+_NUMBER_WITH_EXPONENT_RE = re.compile(r"^-?(?:0|[1-9][0-9]*)(?:[.][0-9]+)?[eE][+-]?[0-9]+$")
 _WS = set(" \t\n\r")
 _HEX = set("0123456789abcdefABCDEF")
 _ESCAPES = set('"\\/bfnrt')
@@ -85,9 +95,19 @@ class JSONPushdownAutomaton:
     def is_error(self):
         return self.state == "error"
 
+    def _number_is_finite(self) -> bool:
+        """A number literal this engine can represent as a finite IEEE-754 value."""
+        try:
+            return math.isfinite(float(self._number))
+        except (TypeError, ValueError, OverflowError):
+            return False
+
     def finish(self):
         """Complete a pending number/literal at end-of-input (RFC 8259 allows EOF)."""
         if self.state == "number" and _NUMBER_RE.fullmatch(self._number):
+            if not self._number_is_finite():
+                self._fail("number outside finite IEEE-754 range", len(self.text))
+                return False
             self._finish_value(len(self.text))
         elif self.state == "literal" and self._literal_pos == len(self._literal):
             self._finish_value(len(self.text))
@@ -139,6 +159,9 @@ class JSONPushdownAutomaton:
             if ch in _WS or ch in ",}]":
                 if not _NUMBER_RE.fullmatch(self._number):
                     self._fail(f"invalid JSON number {self._number!r}", offset)
+                    return True
+                if not self._number_is_finite():
+                    self._fail("number outside finite IEEE-754 range", offset)
                     return True
                 self._finish_value(offset)
                 return False
@@ -262,8 +285,21 @@ class JSONPushdownAutomaton:
 
     def _step_number(self, ch, offset):
         candidate = self._number + ch
-        # Permit precisely the prefixes of the JSON number grammar.
-        if re.fullmatch(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]*)?(?:[eE][+-]?[0-9]*)?", candidate):
+        # Permit precisely the prefixes of the JSON number grammar.  ``\.[0-9]*`` used to
+        # accept ``7.E`` and ``1.e``, which no continuation can repair; that let the masker
+        # emit a token that the strict parser then rejected.
+        if _NUMBER_STEP_RE.fullmatch(candidate) or _NUMBER_TRAILING_DOT_RE.fullmatch(candidate):
+            # Only a *positive* exponent is monotone: more digits there make an overflow
+            # worse forever.  A negative exponent can still shrink the value into range
+            # (``9…9e-4`` overflows but ``9…9e-400`` is finite), so it stays open.
+            if _NUMBER_WITH_EXPONENT_RE.fullmatch(candidate) and not _exponent_can_shrink(candidate):
+                try:
+                    finite = math.isfinite(float(candidate))
+                except (TypeError, ValueError, OverflowError):
+                    finite = False
+                if not finite:
+                    self._fail("number outside finite IEEE-754 range", offset)
+                    return
             self._number = candidate
         else:
             self._fail(f"invalid character {ch!r} in number {self._number!r}", offset)
@@ -330,16 +366,35 @@ class TokenMasker:
         self.cache_size = max(16, int(cache_size))
         self.schema = schema
         self._cache = OrderedDict()
+        #: Incremental automaton reuse: a decode step appends a few characters to the
+        #: document, so re-feeding the whole prefix made masking O(document) per token and
+        #: O(n²) over a generation (an 80 KB prefix cost ~143 ms per step).
+        self._machine: JSONPushdownAutomaton | None = None
+        self._machine_prefix = ""
         self.stats = MaskStats(vocabulary=len(self.vocabulary))
 
     def _state_for(self, prefix):
         if self.schema is not None:
             from .schema_pda import SchemaJSONAutomaton
             machine = SchemaJSONAutomaton(self.schema)
-        else:
-            machine = JSONPushdownAutomaton()
+            if prefix and not machine.feed(prefix):
+                raise JSONSyntaxError(f"invalid JSON prefix: {machine.error}")
+            return machine
+        cached = self._machine
+        if cached is not None:
+            if prefix == self._machine_prefix:
+                return cached
+            if prefix.startswith(self._machine_prefix):
+                probe = cached.clone()
+                if probe.feed(prefix[len(self._machine_prefix):]):
+                    self._machine = probe
+                    self._machine_prefix = prefix
+                    return probe
+        machine = JSONPushdownAutomaton()
         if prefix and not machine.feed(prefix):
             raise JSONSyntaxError(f"invalid JSON prefix: {machine.error}")
+        self._machine = machine
+        self._machine_prefix = prefix
         return machine
 
     def _cache_key(self, prefix, machine):
@@ -417,6 +472,8 @@ class TokenMasker:
 
     def clear_cache(self):
         self._cache.clear()
+        self._machine = None
+        self._machine_prefix = ""
 
 
 def json_number(value, precision=None):
@@ -510,6 +567,12 @@ def _scalar_json(value):
     }:
         return json.dumps(str(value))
     return None
+
+
+def _exponent_can_shrink(number: str) -> bool:
+    """True when the exponent already carries a minus sign (extra digits lower the value)."""
+    marker = max(number.rfind("e"), number.rfind("E"))
+    return marker != -1 and marker + 1 < len(number) and number[marker + 1] == "-"
 
 
 def _iso_duration(delta):

@@ -46,6 +46,15 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             return
         content = self.server.content
+        if isinstance(content, str) and content.startswith("__HTTP_ERROR__:"):
+            status = int(content.split(":", 1)[1])
+            payload = json.dumps({"error": {"message": "upstream failure"}}).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         if b'"stream": true' in body or b'"stream":true' in body:
             sse = (
                 f'data: {{"id":"x","object":"chat.completion.chunk","choices":[{{"index":0,'
@@ -189,6 +198,13 @@ def failing_stack(spec_file):
     stack.close()
 
 
+@pytest.fixture(scope="module")
+def error_stack(spec_file):
+    stack = _LiveServe("__HTTP_ERROR__:429", spec_file, "followup")
+    yield stack
+    stack.close()
+
+
 def _body(spec: str = "followup"):
     return {
         "model": "stub",
@@ -225,6 +241,30 @@ def test_nonstreaming_fail_returns_422_with_violations(failing_stack):
     parsed = json.loads(body)
     assert parsed["error"]["type"] == "vexx_verification_failed"
     assert parsed["vexx_certificate"]["status"] == "FAIL"
+
+
+def test_upstream_error_status_is_forwarded(error_stack):
+    # A JSON error body used to be re-labelled 200 by the proxy, hiding rate limits.
+    status, headers, body = error_stack.post(_body())
+    assert status == 429
+    assert headers.get("X-Vexx-Verification") == "upstream-error"
+    assert json.loads(body)["error"]["message"] == "upstream failure"
+
+
+def test_unknown_spec_is_rejected(passing_stack):
+    status, _, body = passing_stack.post(_body("does-not-exist"))
+    assert status == 400
+    assert json.loads(body)["error"]["type"] == "unknown_spec"
+
+
+def test_oversized_request_is_rejected(passing_stack):
+    conn = http.client.HTTPConnection("127.0.0.1", passing_stack.port, timeout=10)
+    conn.putrequest("POST", "/v1/chat/completions")
+    conn.putheader("Content-Length", str(17 * 1024 * 1024))
+    conn.endheaders()
+    response = conn.getresponse()
+    assert response.status == 413
+    conn.close()
 
 
 def test_streaming_injects_certificate_before_done(passing_stack):

@@ -26,6 +26,12 @@ class VexxVLLMBridge:
         """Pass these to vLLM ``SamplingParams`` / ``LLM.generate`` to enforce masking."""
         return {"logits_processors": [self.logits_processor]}
 
+    def checkpoint_adapter(self, host: Any = None, **kwargs: Any):
+        """KV-cache snapshot/rewind for jump-back search (see ``kv_checkpoint``)."""
+        from .kv_checkpoint import VLLMCheckpointAdapter
+
+        return VLLMCheckpointAdapter(host if host is not None else self.model, **kwargs)
+
     def patch(self, engine: Any = None) -> Any:
         target = engine if engine is not None else self.model
         if target is None:

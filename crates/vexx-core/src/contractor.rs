@@ -222,32 +222,88 @@ fn revise_linear(
     if !compatible(total, op, target) {
         return Revise::Empty;
     }
-    if op == CmpOp::Eq {
-        // Narrow only on equality: inequalities need the directional inverse to stay sound
-        // and are already covered by the forward test above.
-        let mut changed = false;
-        for (index, (var, coeff)) in coeffs.iter().enumerate() {
-            let mut rest = Interval::point(0.0);
-            for (other_index, (other_var, other_coeff)) in coeffs.iter().enumerate() {
-                if other_index == index {
-                    continue;
-                }
-                rest = rest.add(get(domains, *other_var).mul(Interval::point(*other_coeff)));
+    if !matches!(
+        op,
+        CmpOp::Eq | CmpOp::Le | CmpOp::Lt | CmpOp::Ge | CmpOp::Gt
+    ) {
+        return Revise::Stable;
+    }
+    // HC4 inverse for every supported comparison.  The bound must be *directional*: for
+    // ``sum <= rhs`` the only sound bound on x_i uses the smallest contribution the other
+    // terms can take.  Dividing by the whole rest interval would prune feasible values
+    // (``x + y <= 10`` with ``y in [0, 1]`` must not force ``x >= 9``).  The previous
+    // implementation skipped inequalities entirely, so the native engine reported
+    // ``feasible`` for boxes Python refutes (e.g. ``x >= 0 and 2x <= -1``).
+    let mut changed = false;
+    for (index, (var, coeff)) in coeffs.iter().enumerate() {
+        if *coeff == 0.0 {
+            continue;
+        }
+        let mut rest_lo = 0.0;
+        let mut rest_hi = 0.0;
+        for (other_index, (other_var, other_coeff)) in coeffs.iter().enumerate() {
+            if other_index == index || *other_coeff == 0.0 {
+                continue;
             }
-            let narrowed =
-                get(domains, *var).intersect(target.sub(rest).div(Interval::point(*coeff)));
-            if narrowed.is_empty() {
+            let other = get(domains, *other_var);
+            if other.is_empty() {
                 return Revise::Empty;
             }
-            changed |= update(domains, *var, narrowed);
+            if *other_coeff > 0.0 {
+                rest_lo += other_coeff * other.lo;
+                rest_hi += other_coeff * other.hi;
+            } else {
+                rest_lo += other_coeff * other.hi;
+                rest_hi += other_coeff * other.lo;
+            }
         }
-        return if changed {
-            Revise::Changed
-        } else {
-            Revise::Stable
+        // ``-inf + inf`` on mixed-sign unbounded terms is indeterminate; narrowing with it
+        // would turn a NaN into Interval::EMPTY, which reads as a refutation.  Stay silent.
+        if rest_lo.is_nan() || rest_hi.is_nan() {
+            continue;
+        }
+        let bound = match op {
+            CmpOp::Le | CmpOp::Lt => Interval::point(rhs)
+                .sub(Interval::point(rest_lo))
+                .div(Interval::point(*coeff)),
+            CmpOp::Ge | CmpOp::Gt => Interval::point(rhs)
+                .sub(Interval::point(rest_hi))
+                .div(Interval::point(*coeff)),
+            _ => Interval::point(rhs)
+                .sub(Interval::new(rest_lo, rest_hi))
+                .div(Interval::point(*coeff)),
         };
+        if bound.is_empty() {
+            continue;
+        }
+        let current = get(domains, *var);
+        let narrowed = match op {
+            CmpOp::Le | CmpOp::Lt => {
+                if *coeff > 0.0 {
+                    current.intersect(Interval::new(f64::NEG_INFINITY, bound.hi))
+                } else {
+                    current.intersect(Interval::new(bound.lo, f64::INFINITY))
+                }
+            }
+            CmpOp::Ge | CmpOp::Gt => {
+                if *coeff > 0.0 {
+                    current.intersect(Interval::new(bound.lo, f64::INFINITY))
+                } else {
+                    current.intersect(Interval::new(f64::NEG_INFINITY, bound.hi))
+                }
+            }
+            _ => current.intersect(bound),
+        };
+        if narrowed.is_empty() {
+            return Revise::Empty;
+        }
+        changed |= update(domains, *var, narrowed);
     }
-    Revise::Stable
+    if changed {
+        Revise::Changed
+    } else {
+        Revise::Stable
+    }
 }
 
 /// Helper for quadratic revision: y = Lᵀ x (L is lower-triangular), so xᵀ A x = ||y||²
@@ -444,6 +500,46 @@ mod tests {
         assert!(a.contains(1.5) && a.contains(2.0), "a = {:?}", a);
         assert!(a.lo >= 1.5 - 1e-9, "a must stay inside 1.5/b for b in [0.75, 1]");
         assert!(b.contains(0.75) && b.hi <= 1.0 + 1e-9, "b = {:?}", b);
+    }
+
+    #[test]
+    fn inequalities_narrow_directionally_and_refute() {
+        // x >= 0 and 2x <= -1 is empty only after directional narrowing; the previous
+        // forward-only native check reported it feasible.
+        let mut refutable = Contractor::new(boxed(&[(0, -2.0, 1.0)]));
+        refutable.push(Constraint::Linear {
+            coeffs: vec![(0, 1.0)],
+            rhs: 0.0,
+            op: CmpOp::Ge,
+        });
+        refutable.push(Constraint::Linear {
+            coeffs: vec![(0, 2.0)],
+            rhs: -1.0,
+            op: CmpOp::Le,
+        });
+        assert!(!refutable.propagate(8));
+
+        // x + y <= 10 with y in [0, 1] caps x at 10 but must not raise its lower bound.
+        let mut narrow = Contractor::new(boxed(&[(0, 0.0, 100.0), (1, 0.0, 1.0)]));
+        narrow.push(Constraint::Linear {
+            coeffs: vec![(0, 1.0), (1, 1.0)],
+            rhs: 10.0,
+            op: CmpOp::Le,
+        });
+        assert!(narrow.propagate(8));
+        assert_eq!(narrow.domain(0).lo, 0.0);
+        assert!(narrow.domain(0).hi <= 10.0 + 1e-9);
+        assert_eq!(narrow.domain(1), Interval::new(0.0, 1.0));
+
+        // A negative coefficient flips the side of the bound.
+        let mut flipped = Contractor::new(boxed(&[(0, -5.0, 5.0)]));
+        flipped.push(Constraint::Linear {
+            coeffs: vec![(0, -2.0)],
+            rhs: -4.0,
+            op: CmpOp::Le,
+        });
+        assert!(flipped.propagate(4));
+        assert!(flipped.domain(0).lo >= 2.0 - 1e-12);
     }
 
     #[test]

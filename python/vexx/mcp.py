@@ -85,12 +85,10 @@ class UntrustedString(str):
         return frozenset(sources) if sources else frozenset(("untrusted",))
 
     def _wrap(self, value, *extra) -> UntrustedString:
-        srcs = set(self.sources)
+        srcs = set(self.sources) or {"untrusted"}
         for v in extra:
             if isinstance(v, UntrustedString):
                 srcs |= set(v.sources)
-        if not srcs:
-            srcs = set(self.sources) or {"untrusted"}
         return UntrustedString(str(value), frozenset(srcs))
 
     def __add__(self, other):
@@ -171,6 +169,52 @@ class UntrustedString(str):
     def title(self):
         return UntrustedString(str(self).title(), self.sources)
 
+    # -- string-returning methods that must not launder taint -----------------
+    # ``u.split(";")[0]`` used to return a plain ``str``, so a prompt-injected payload
+    # could be split and then pass ``is_untainted()`` with its provenance erased.
+
+    def split(self, sep=None, maxsplit=-1):
+        return [UntrustedString(part, self.sources) for part in str(self).split(sep, maxsplit)]
+
+    def rsplit(self, sep=None, maxsplit=-1):
+        return [UntrustedString(part, self.sources) for part in str(self).rsplit(sep, maxsplit)]
+
+    def splitlines(self, keepends=False):
+        return [UntrustedString(part, self.sources) for part in str(self).splitlines(keepends)]
+
+    def partition(self, sep):
+        return tuple(UntrustedString(part, self.sources) for part in str(self).partition(sep))
+
+    def rpartition(self, sep):
+        return tuple(UntrustedString(part, self.sources) for part in str(self).rpartition(sep))
+
+    def casefold(self):
+        return UntrustedString(str(self).casefold(), self.sources)
+
+    def swapcase(self):
+        return UntrustedString(str(self).swapcase(), self.sources)
+
+    def capitalize(self):
+        return UntrustedString(str(self).capitalize(), self.sources)
+
+    def removeprefix(self, prefix):
+        return UntrustedString(str(self).removeprefix(str(prefix)), self.sources)
+
+    def removesuffix(self, suffix):
+        return UntrustedString(str(self).removesuffix(str(suffix)), self.sources)
+
+    def center(self, width, fillchar=" "):
+        return UntrustedString(str(self).center(width, fillchar), self.sources)
+
+    def ljust(self, width, fillchar=" "):
+        return UntrustedString(str(self).ljust(width, fillchar), self.sources)
+
+    def rjust(self, width, fillchar=" "):
+        return UntrustedString(str(self).rjust(width, fillchar), self.sources)
+
+    def zfill(self, width):
+        return UntrustedString(str(self).zfill(width), self.sources)
+
     @classmethod
     def __get_pydantic_core_schema__(cls, source: Any, handler: Any):
         from pydantic_core import core_schema
@@ -193,10 +237,13 @@ def taint(value: Any, sources: Sequence[str] | None = None) -> UntrustedString:
     return UntrustedString(str(value), sources)
 
 
-def safe_format(template: Any, *args: Any, **kwargs: Any) -> UntrustedString:
+def safe_format(template: Any, *args: Any, **kwargs: Any) -> str:
     """Format ``template`` while preserving taint from any untrusted input.
 
-    Use this instead of f-strings / ``str.format`` when handling untrusted text.
+    Returns a plain ``str`` when nothing untrusted took part: constructing an
+    ``UntrustedString`` with no sources used to fall back to the ``{"untrusted"}`` tag, so
+    ``safe_format("hello {}", "world")`` falsely reported taint.  Use this instead of
+    f-strings / ``str.format`` when handling untrusted text.
     """
     srcs: set[str] = set()
     if isinstance(template, UntrustedString):
@@ -209,8 +256,8 @@ def safe_format(template: Any, *args: Any, **kwargs: Any) -> UntrustedString:
             srcs |= set(v.sources)
     result = str(template).format(*args, **kwargs)
     if not srcs:
-        srcs = {"untrusted"} if isinstance(template, UntrustedString) else set()
-    return UntrustedString(str(result), frozenset(srcs) if srcs else frozenset())
+        return str(result)
+    return UntrustedString(str(result), frozenset(srcs))
 
 
 def _taint_map(mapping: Mapping[str, Any] | None, prefix: str = "") -> dict[str, frozenset[str]]:

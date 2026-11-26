@@ -21,6 +21,12 @@ class SGLangBridge:
     def sampling_params(self) -> dict:
         return {"logits_processor": [self.logits_processor]}
 
+    def checkpoint_adapter(self, host: Any = None, **kwargs: Any):
+        """Jump-forward prefill and KV checkpointing (see ``kv_checkpoint``)."""
+        from .kv_checkpoint import SGLangCheckpointAdapter
+
+        return SGLangCheckpointAdapter(host if host is not None else self.model, **kwargs)
+
     def patch(self, engine: Any = None) -> Any:
         target = engine if engine is not None else self.model
         if target is None:

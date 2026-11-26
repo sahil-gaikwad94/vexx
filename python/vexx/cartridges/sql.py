@@ -55,6 +55,10 @@ class SqlCatalog:
     foreign_keys: list[ForeignKey] = field(default_factory=list)
     tenant_column: str = "tenant_id"
     require_tenant: bool = False
+    #: Opt-in hardening: require an explicit tenant predicate for *every* joined table that
+    #: carries the tenant column, not just one of them.  Off by default so that a join
+    #: through a foreign key with a single tenant predicate keeps verifying, as before.
+    require_tenant_on_joins: bool = False
 
     def columns(self, table: str) -> list[str] | None:
         requested = table.split(".")[-1].lower()
@@ -138,8 +142,49 @@ class SqlVerifier:
         return self.valid_column(t1, c1) and self.valid_column(t2, c2)
 
     def tenant_isolation_ok(self, predicate: str, tenant_col: str | None = None) -> bool:
+        """Whether ``predicate`` contains a real conjunctive tenant equality.
+
+        This used to be a substring test, so ``note = 'tenant_id'`` or an ``OR`` branch
+        passed.  It now parses the predicate with the same AST rules as :meth:`verify`.
+        """
         column = (tenant_col or self.catalog.tenant_column).lower()
-        return column in predicate.lower()
+        try:
+            import sqlglot
+            from sqlglot import expressions as exp
+        except Exception:
+            return False
+        clause = predicate.strip()
+        if clause.lower().startswith("where"):
+            clause = clause[5:].lstrip()
+        try:
+            tree = sqlglot.parse_one(f"SELECT 1 WHERE {clause}")
+        except Exception:
+            return False
+        where = tree.args.get("where")
+        if where is None:
+            return False
+
+        def conjuncts(node):
+            # Parenthesised conjuncts must be unwrapped: ``WHERE (tenant_id = 1) AND x``
+            if isinstance(node, exp.Paren):
+                yield from conjuncts(node.this)
+            elif isinstance(node, exp.And):
+                yield from conjuncts(node.left)
+                yield from conjuncts(node.right)
+            else:
+                yield node
+
+        for part in conjuncts(where.this):
+            if not isinstance(part, exp.EQ):
+                continue
+            # A conjunctive equality whose left or right side *is* the tenant column.
+            for side, other in ((part.left, part.right), (part.right, part.left)):
+                if not isinstance(side, exp.Column) or side.name.lower() != column:
+                    continue
+                if isinstance(other, exp.Column) and other.name.lower() == column:
+                    continue
+                return True
+        return False
 
     # -- verification ----------------------------------------------------
     def verify(self, sql: str) -> SqlVerification:
@@ -259,12 +304,19 @@ class SqlVerifier:
         tenant = self.catalog.tenant_column.lower()
         where = tree.args.get("where")
         has_tenant = False
+        covered_tables: set[str] = set()
+
         def conjuncts(node):
-            if isinstance(node, exp.And):
+            # ``exp.Paren`` must be unwrapped, otherwise ``WHERE (tenant_id = 1) AND ...``
+            # was invisible and the query was reported as missing tenant isolation.
+            if isinstance(node, exp.Paren):
+                yield from conjuncts(node.this)
+            elif isinstance(node, exp.And):
                 yield from conjuncts(node.left)
                 yield from conjuncts(node.right)
             else:
                 yield node
+
         if where is not None:
             for part in conjuncts(where.this):
                 if not isinstance(part, exp.EQ):
@@ -275,8 +327,21 @@ class SqlVerifier:
                     resolved = resolve_column(cols[0])
                     if resolved:
                         has_tenant = True
-        if self.catalog.require_tenant and not has_tenant:
-            errors.append(f"missing required conjunctive tenant-isolation predicate on `{self.catalog.tenant_column}`")
+                        covered_tables.add(resolved[0])
+        if self.catalog.require_tenant and self.catalog.require_tenant_on_joins:
+            # Every joined table that carries the tenant column must be constrained; one
+            # table's predicate does not isolate the rows of its join partners.
+            required = {t for t in tables_seen if self.valid_column(t, tenant)}
+            missing = sorted(required - covered_tables)
+            if missing:
+                errors.append(
+                    f"missing required conjunctive tenant-isolation predicate on "
+                    f"`{self.catalog.tenant_column}` for table(s): {', '.join(missing)}"
+                )
+        elif self.catalog.require_tenant and not has_tenant:
+            errors.append(
+                f"missing required conjunctive tenant-isolation predicate on `{self.catalog.tenant_column}`"
+            )
 
         return SqlVerification(
             ok=not errors,

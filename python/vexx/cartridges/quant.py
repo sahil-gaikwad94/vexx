@@ -344,6 +344,12 @@ def black_scholes_call(S: float, K: float, r: float, sigma: float, T: float) -> 
     T = float(T)
     if T <= 0:
         return max(0.0, S - K)
+    # Degenerate but well-defined boundaries: a worthless/zero strike or a zero spot has a
+    # closed-form limit, while the general formula divides by K and takes log(S / K).
+    if S == 0.0:
+        return 0.0
+    if K == 0.0:
+        return S
     if sigma <= 0:
         return max(0.0, S - K * math.exp(-r * T))
     d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
@@ -360,6 +366,10 @@ def black_scholes_put(S: float, K: float, r: float, sigma: float, T: float) -> f
     T = float(T)
     if T <= 0:
         return max(0.0, K - S)
+    if S == 0.0:
+        return K * math.exp(-r * T)
+    if K == 0.0:
+        return 0.0
     if sigma <= 0:
         return max(0.0, K * math.exp(-r * T) - S)
     d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
@@ -382,23 +392,31 @@ def implied_volatility(
 
     if price <= 0 or T <= 0 or S <= 0 or K <= 0:
         return None
-    intrinsic = max(0.0, (S - K) if is_call else (K - S))
-    upper_bound = S if is_call else K * math.exp(-r * T)
+    # The European no-arbitrage band is on *discounted* intrinsic value; using the
+    # undiscounted ``K - S`` rejected valid deep-ITM puts whenever ``r > 0``.
+    discounted_strike = K * math.exp(-r * T)
+    intrinsic = max(0.0, (S - discounted_strike) if is_call else (discounted_strike - S))
+    upper_bound = S if is_call else discounted_strike
     if price < intrinsic - 1e-12 or price > upper_bound + 1e-12:
         return None
     fn = black_scholes_call if is_call else black_scholes_put
     lo, hi = 1e-8, 10.0
     if fn(S, K, r, hi, T) < price:
         return None
+    # Converge on the *volatility* interval, not on a price difference: deep-ITM options
+    # have a nearly flat vega, so an absolute price tolerance stops the search far from the
+    # true root (a 5% vol put came back as 3.9%).
     for _ in range(max_iterations):
         mid = 0.5 * (lo + hi)
         value = fn(S, K, r, mid, T)
-        if abs(value - price) <= tol:
+        if abs(value - price) <= tol and hi - lo <= 1e-9:
             return mid
         if value < price:
             lo = mid
         else:
             hi = mid
+        if hi - lo <= 1e-12:
+            break
     return 0.5 * (lo + hi)
 
 

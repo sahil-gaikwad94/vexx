@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -16,6 +17,20 @@ def _next_down(x: float) -> float:
 
 def _next_up(x: float) -> float:
     return math.nextafter(x, math.inf)
+
+
+def _lower(value: float) -> float:
+    """Outward-rounded lower endpoint; ``inf - inf`` widens to ``-inf`` instead of raising."""
+    if math.isnan(value):
+        return float("-inf")
+    return _next_down(value)
+
+
+def _upper(value: float) -> float:
+    """Outward-rounded upper endpoint; an indeterminate sum widens to ``+inf``."""
+    if math.isnan(value):
+        return float("inf")
+    return _next_up(value)
 
 
 @dataclass
@@ -80,10 +95,15 @@ class Interval:
 
     # ---- outward-rounded operations ----
     def add(self, other: Interval) -> Interval:
-        return Interval(_next_down(self.lo + other.lo), _next_up(self.hi + other.hi))
+        if self.is_empty() or other.is_empty():
+            return Interval.empty()
+        # ``-inf + inf`` is NaN; an empty interval used to crash the contractor here.
+        return Interval(_lower(self.lo + other.lo), _upper(self.hi + other.hi))
 
     def sub(self, other: Interval) -> Interval:
-        return Interval(_next_down(self.lo - other.hi), _next_up(self.hi - other.lo))
+        if self.is_empty() or other.is_empty():
+            return Interval.empty()
+        return Interval(_lower(self.lo - other.hi), _upper(self.hi - other.lo))
 
     def mul(self, other: Interval) -> Interval:
         if self.is_empty() or other.is_empty():
@@ -107,7 +127,11 @@ class Interval:
             # over-approximation, not a split that silently drops the pole.
             return Interval.entire()
         vals = (self.lo / other.lo, self.lo / other.hi, self.hi / other.lo, self.hi / other.hi)
-        return Interval(_next_down(min(vals)), _next_up(max(vals)))
+        if any(math.isnan(v) for v in vals):
+            # ``inf / inf`` on a degenerate interval: no finite quotient exists, so the
+            # sound answer is the whole line rather than a ValueError from the constructor.
+            return Interval.entire()
+        return Interval(_lower(min(vals)), _upper(max(vals)))
 
     def sqr(self) -> Interval:
         if self.lo >= 0:
@@ -151,7 +175,9 @@ class Interval:
         # delimiter detection (do not strip trailing delimiters)
         cut = None
         for i, ch in enumerate(s):
-            if ch in (",", "}", "]", " ", "\n", "\t"):
+            # ``\r`` is JSON whitespace and terminates a number just like ``\n``.  Leaving it
+            # out made ``"342\r"`` look like an open integer prefix whose span grew to 1e17.
+            if ch in (",", "}", "]", " ", "\n", "\t", "\r"):
                 cut = i
                 break
         if cut is not None:
@@ -167,10 +193,38 @@ class Interval:
             return domain_bounds.intersect(Interval(0.0, float("inf")))
 
         is_neg = num_part.startswith("-")
-        # Reject leading-zero integer prefixes like "00", "-00", "01".
+        # Reject leading-zero integer prefixes like "00", "-00", "01" *and* "01.5":
+        # the check must look at the integer part regardless of a decimal point.
         _digits = num_part.lstrip("-").lstrip("+")
-        if "." not in _digits and "e" not in _digits.lower() and len(_digits) > 1 and _digits.startswith("0") and _digits.isdigit():
+        _int_part = _digits.split(".")[0].split("e")[0].split("E")[0]
+        if len(_int_part) > 1 and _int_part.startswith("0") and _int_part.isdigit():
             return Interval.empty()
+        if allow_exp and "e" in num_part.lower():
+            # A scientific-notation prefix is not a point: ``"1e1"`` can still become
+            # ``"1e10"``.  Validate the syntax, then answer whether *some* completion lands
+            # in the domain.  ``float("1e")`` used to raise here, so every exponent token
+            # emptied the domain and scientific notation could not be decoded at all.
+            exp_match = re.fullmatch(
+                r"-?(?:0|[1-9]\d*)(?:\.\d+)?[eE]([+-]?\d*)", num_part, re.IGNORECASE
+            )
+            if exp_match is None:
+                return Interval.empty()
+            mantissa_text = re.split(r"[eE]", num_part)[0]
+            try:
+                mantissa = float(mantissa_text)
+            except (TypeError, ValueError):
+                return Interval.empty()
+            exponent_text = exp_match.group(1) or ""
+            if is_closed and exponent_text and exponent_text not in ("+", "-"):
+                try:
+                    point_value = float(num_part)
+                except (TypeError, ValueError):
+                    return Interval.empty()
+                if not math.isfinite(point_value):
+                    return Interval.empty()
+                return domain_bounds.intersect(Interval(point_value, point_value))
+            return _exp_prefix_span(mantissa, exponent_text, domain_bounds)
+
         # strip a single trailing dot
         clean = num_part[:-1] if num_part.endswith(".") else num_part
         try:
@@ -182,17 +236,6 @@ class Interval:
 
         if is_closed:
             return domain_bounds.intersect(Interval(base_val, base_val))
-
-        if allow_exp and ("e" in num_part.lower() or "E" in num_part):
-            # If the parsed value already falls outside the domain, the prefix cannot
-            # complete to any in-domain value.
-            try:
-                _pt = Interval(base_val, base_val)
-            except Exception:
-                _pt = Interval.empty()
-            if _pt.intersect(domain_bounds).is_empty():
-                return Interval.empty()
-            return Interval(domain_bounds.lo, domain_bounds.hi)
 
         # decimal point present
         if "." in num_part:
@@ -263,6 +306,57 @@ Interval.EMPTY = Interval.empty()
 Interval.ENTIRE = Interval.entire()
 
 
+def _exp_prefix_span(mantissa: float, exponent_text: str, domain: Interval) -> Interval:
+    """Values reachable by completing a scientific-notation prefix.
+
+    ``"1e"`` can still become ``"1e10"`` or ``"1e-3"``; ``"1e1"`` can become ``"1e10"``
+    but not ``"1e2"``.  The exponent may always gain more digits, so the reachable set is
+    every ``mantissa * 10**E`` whose exponent spelling starts with the typed prefix.
+    The answer is a sound superset (the domain half-plane containing a real completion),
+    which is exactly what a decoder needs: is this prefix still viable?
+    """
+    if mantissa == 0.0:
+        return domain.intersect(Interval(0.0, 0.0))
+    prefix = exponent_text.lstrip("+")
+    negative_exponent = exponent_text.startswith("-")
+    if prefix.startswith("-"):
+        negative_exponent = True
+        prefix = prefix.lstrip("-")
+    matched = False
+    for exponent in range(-323, 309):
+        if exponent < 0:
+            if not negative_exponent:
+                continue
+            spelling = str(-exponent)
+        else:
+            if negative_exponent:
+                continue
+            spelling = str(exponent)
+        if prefix and not spelling.startswith(prefix):
+            continue
+        try:
+            value = mantissa * (10.0 ** exponent)
+        except OverflowError:
+            continue
+        if not math.isfinite(value):
+            continue
+        if domain.lo <= value <= domain.hi:
+            matched = True
+            break
+    if not matched:
+        # An open exponent may still gain a minus sign and enough digits to underflow to 0.0
+        # (``"1e"`` -> ``"1e-999"``), which is a representable completion.  Treating the
+        # prefix as dead there pruned a genuinely reachable value.
+        zero_reachable = exponent_text == "" or exponent_text.startswith("-")
+        if zero_reachable and domain.lo <= 0.0 <= domain.hi:
+            matched = True
+    if not matched:
+        return Interval.empty()
+    if mantissa > 0:
+        return domain.intersect(Interval(0.0, float("inf")))
+    return domain.intersect(Interval(float("-inf"), 0.0))
+
+
 @dataclass
 class AffineForm:
     center: float = 0.0
@@ -314,7 +408,12 @@ class AffineForm:
         for nid, coeff in terms:
             mapping[nid] = mapping.get(nid, 0.0) + coeff
         combined = [(nid, c) for nid, c in mapping.items() if c != 0.0]
-        err = abs(x0) * ry + abs(y0) * rx + rx * ry
+        # Only the *uncertainty* radii contribute new error: the deterministic ``c * y0``
+        # and ``c * x0`` products are already first-order terms.  Using ``ry``/``rx``
+        # (which include the term sums) double-counted them and inflated every product
+        # width by roughly 2x, which made contractors reject feasible points.
+        err = abs(x0) * other.err_radius + abs(y0) * self.err_radius + rx * ry
+        err = _next_up(err) if err > 0.0 else err
         return AffineForm(center=x0 * y0, terms=combined, err_radius=err)
 
     def __mul__(self, other):

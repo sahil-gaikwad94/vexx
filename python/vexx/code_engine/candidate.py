@@ -64,6 +64,19 @@ def _deep_copy_json(value: Any) -> Any:
     return json.loads(json.dumps(value))
 
 
+def _outcome(result: Any) -> tuple[str, Any]:
+    """Comparable ``(kind, value)`` for a sandbox result.
+
+    JSON-native and literal values compare by canonical value; opaque values compare by
+    their bounded display string and type name, so two different non-JSON objects are never
+    mistaken for each other.
+    """
+    kind = getattr(result, "serialized_kind", "none")
+    if kind in {"json", "literal"}:
+        return ("value", _canonical(getattr(result, "result", None)))
+    return ("repr", (getattr(result, "type_name", ""), getattr(result, "repr", None)))
+
+
 def _canonical(value: Any) -> Any:
     """Canonical JSON-compatible representation for comparison."""
     if isinstance(value, tuple):
@@ -123,31 +136,32 @@ class CandidateVerifier:
         mutation_free = True
         import time
         t0 = time.time()
-        if syntax_ok and policy_ok:
-            for idx, tc in enumerate(test_cases):
-                original = _deep_copy_json(tc["input"])
-                res = self.runner.run(source, function_name, copy.deepcopy(original))
+        if syntax_ok and policy_ok and test_cases:
+            originals = [_deep_copy_json(tc["input"]) for tc in test_cases]
+            # One child process for every case: the interpreter start-up (~25-40 ms) was
+            # paid per probe, dominating small test suites.
+            results = self.runner.run_batch(
+                source,
+                function_name,
+                [copy.deepcopy(original) for original in originals],
+                per_case_timeout=min(self.config.sandbox_wall_timeout_s, 2.0),
+            )
+            for idx, (tc, original, res) in enumerate(zip(test_cases, originals, results)):
                 if not res.ok:
                     errors.append(f"Test {idx} raised {res.error}")
                     continue
-                try:
-                    result = res.result
-                    if result is None and res.repr is not None:
-                        import ast as _ast
-                        result = _ast.literal_eval(res.repr)
-                except Exception:
-                    errors.append(f"Test {idx} returned a non-literal: {res.repr!r}")
+                if res.serialized_kind not in {"json", "literal"}:
+                    errors.append(
+                        f"Test {idx} returned a non-JSON value ({res.type_name or 'unknown'}): {res.repr!r}"
+                    )
                     continue
+                result = res.result
                 expected_ok = False
                 if "expected_one_of" in tc:
                     expected_ok = any(_canonical(result) == _canonical(exp) for exp in tc["expected_one_of"])
                 else:
                     expected_ok = _canonical(result) == _canonical(tc.get("expected"))
-                after = res.input_after
-                try:
-                    after_val = after if not isinstance(after, str) else __import__("ast").literal_eval(after)
-                except Exception:
-                    after_val = after
+                after_val = res.input_after
                 mutation_ok = _canonical(after_val) == _canonical(original)
                 if expected_ok and mutation_ok:
                     passed += 1
@@ -322,14 +336,19 @@ class CandidateVerifier:
             if not cand_res.ok:
                 errors.append({"input": probe, "side": "candidate", "error": cand_res.error})
                 continue
-            try:
-                exp = ref_res.result if ref_res.result is not None else __import__("ast").literal_eval(ref_res.repr)
-                act = cand_res.result if cand_res.result is not None else __import__("ast").literal_eval(cand_res.repr)
-                agrees = _canonical(act) == _canonical(exp)
-            except Exception:
-                agrees = ref_res.repr == cand_res.repr
-            if not agrees:
-                mismatches.append({"input": probe, "expected": ref_res.repr, "actual": cand_res.repr})
+            # Compare (kind, value).  Comparing only literals made every pair of opaque
+            # values look equal: ``object()`` vs ``None`` used to report ``agrees=True``
+            # because both decoded to ``None``.
+            exp = _outcome(ref_res)
+            act = _outcome(cand_res)
+            if exp != act:
+                mismatches.append({
+                    "input": probe,
+                    "expected": exp[1],
+                    "actual": act[1],
+                    "expected_kind": exp[0],
+                    "actual_kind": act[0],
+                })
         return {
             "fn": function_name,
             "checked": len(probe_inputs),

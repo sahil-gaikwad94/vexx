@@ -603,11 +603,15 @@ class ProofCertificate:
             raise ValueError("public_key must be 32-byte public key or Ed25519PublicKey")
 
         payload = self._signing_payload()
-        signature = bytes.fromhex(sig_hex)
+        try:
+            signature = bytes.fromhex(sig_hex)
+        except (TypeError, ValueError):
+            # A tampered/truncated signature is simply invalid, not a crash.
+            return False
         try:
             verifying_key.verify(signature, payload)
             return True
-        except InvalidSignature:
+        except (InvalidSignature, ValueError):
             return False
 
     @classmethod
@@ -847,18 +851,24 @@ def verify_certificate(
 
 
 def _canonical_witness(values: Mapping[str, Any], report: Any = None) -> dict[str, Any]:
-    """Return a witness whose set/dict ordering is canonical for digest + SMT rendering."""
+    """Return a witness with deterministic key/element order and *native* containers.
+
+    The SMT renderer and the live validator both expect real Python ``dict`` objects
+    (``weights = {"AAPL": 0.4}``), so dicts are ordered, never replaced by a
+    ``{"__pairs__": ...}`` tag.  Tagging them made every certificate over a schema with a
+    ``dict`` field fail its own offline verification.  ``canonical_json`` already sorts
+    keys, so preserving the native structure is sufficient for deterministic hashing.
+    """
 
     def _canon(value):
         if isinstance(value, (set, frozenset)):
-            items = sorted((_canon(v) for v in value), key=repr)
-            return {"__set__": items}
-        if isinstance(value, dict):
-            pairs = sorted(
-                ((_canon(k), _canon(v)) for k, v in value.items()),
-                key=lambda kv: repr(kv[0]),
-            )
-            return {"__pairs__": [[k, v] for k, v in pairs]}
+            # Sets are ordered into a list: JSON has no set type and SMT renders arrays.
+            return sorted((_canon(v) for v in value), key=repr)
+        if isinstance(value, Mapping):
+            return {
+                str(k): _canon(v)
+                for k, v in sorted(value.items(), key=lambda kv: str(kv[0]))
+            }
         if isinstance(value, (list, tuple)):
             return [_canon(v) for v in value]
         return value
@@ -866,7 +876,7 @@ def _canonical_witness(values: Mapping[str, Any], report: Any = None) -> dict[st
     out: dict[str, Any] = {}
     for key, value in values.items():
         out[str(key)] = _canon(value)
-    return out
+    return dict(sorted(out.items(), key=lambda kv: str(kv[0])))
 
 
 def build_certificate(

@@ -50,6 +50,25 @@ rather than in this aggregate.
 This measures the Python reference path only. It does not measure a real LLM, GPU kernels or
 KV-cache surgery. For the native engine, see the A/B below.
 
+## Code-engine masking (Python reference path)
+
+Measured with `perf_counter` over 100 repeated `VexxCodeController.mask_logits` calls
+on a synthetic 32,000-token BPE-like vocabulary (60% lowercase fragments, 20%
+punctuation, 10% code keywords such as `range(`/`return `, 10% integers), a
+15-line Python prefix and a fresh logits row per call, Python 3.12:
+
+| version | ms/token |
+| :--- | ---: |
+| unpartitioned per-token evaluation (audit baseline) | 98.7 |
+| + identity-keyed vocab plan, memoised id validation | 50.0 |
+| + tuple `startswith` for forbidden names, set-based bracket test | 33.5 |
+
+The remaining cost is the per-token lexer replay of the ~4.6K structural tokens
+(14% of this vocabulary); the 15 µs/token target requires that lexer in Rust.
+Rust-side JSON masking gains a first-byte partition in `pda.rs`
+(`candidates_classified`), verified for equivalence with the full replay but not
+benchmarked on real BPE vocabularies here.
+
 ## Native engine: measured, not claimed
 
 `benchmarks/native_speedup.py` runs **the same Python call sites twice**, once with the
@@ -93,3 +112,20 @@ cheap calls (short numeric prefixes) may gain little or nothing from delegation 
 per-token loops; and these figures are wall-clock medians on shared CI runners, which vary by
 tens of percent between runs. The numbers answer "is the accelerator wired up and worth its
 boundary cost", not "how fast is Vexx".
+
+### Mask and incremental-automaton audit measurements (November 2026)
+
+Local audit VM (release `libvexx_py.so`, synthetic 32K BPE-like vocabulary, wall clock,
+medians). These are not CI numbers; re-run `benchmarks/native_speedup.py` for the matrix the
+release job publishes.
+
+| workload | before | after | notes |
+| --- | ---: | ---: | --- |
+| `vexx_py.allowed_tokens`, 32K vocab | 16.5 ms | 16.5 ms | stateless fallback, unchanged |
+| trie DFS mask, 32K vocab | — | **0.43 ms** | exact; `Pda` now matches `prefix_status` |
+| `TokenMasker.valid_mask`, 32K vocab | ~88 ms | **~3.4 ms** | trie + cached vocabulary |
+| decoding, 72 KB prefix (8104 steps) | ~O(n) per step | **0.08 ms/step** | incremental automaton reuse |
+| full parse of that 72 KB prefix (cold) | — | ~181 ms | what every step used to pay |
+
+The incremental reuse matters more than the constant factor: masking used to re-feed the whole
+document per token, which is quadratic in generation length.

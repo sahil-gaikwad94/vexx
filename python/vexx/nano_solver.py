@@ -125,6 +125,15 @@ class VexxNanoSolver:
             return
         elif op in ("le", "lt", "ge", "gt", "eq") and len(constraint) == 3:
             coeffs, rhs = self._coeffs(constraint[1]), self._rational(constraint[2])
+            if op == "eq":
+                # Encode ``a^T x == b`` as the conjunction (a^T x <= b) AND (-a^T x <= -b).
+                # Sharing the tracker id keeps UNSAT-core attribution on the equality.
+                # Without the negative half, ``x == 5 and x <= 3`` was reported SAT.
+                self._append(tracker_id, coeffs, rhs, False)
+                negated = {k: -v for k, v in coeffs.items()}
+                self._append(tracker_id, negated, -rhs, False)
+                self._invalidate()
+                return
             if op in ("ge", "gt"):
                 coeffs = {k: -v for k, v in coeffs.items()}
                 rhs = -rhs
@@ -132,9 +141,12 @@ class VexxNanoSolver:
             strict = op == "lt"
         else:
             raise ValueError(f"unsupported solver constraint {constraint!r}")
+        self._append(tracker_id, coeffs, rhs, strict)
+        self._invalidate()
+
+    def _append(self, tracker_id, coeffs, rhs, strict):
         self.constraints.append(_Constraint(tracker_id, coeffs, rhs, strict))
         self.variables.update(coeffs)
-        self._invalidate()
 
     def check(self):
         return self.check_with_timeout(self.timeout_ms)
@@ -145,7 +157,9 @@ class VexxNanoSolver:
         self._invalidate()
         rows = [self._normalize(c.coeffs, c.rhs, c.strict, frozenset({i})) for i, c in enumerate(self.constraints)]
         if len(self.variables) > self.max_variables:
-            return self._unknown("variable budget exhausted")
+            # Fourier–Motzkin is doubly exponential and capped at ``max_variables``; beyond
+            # that the incremental exact simplex decides the same theory without the cap.
+            return self._check_with_simplex(deadline)
         result = self._eliminate(rows, sorted(self.variables, key=repr), deadline)
         if result is None:
             return self._unknown("time or row budget exhausted")
@@ -161,6 +175,31 @@ class VexxNanoSolver:
         self._last_model = model
         self._last_status = SolverStatus.SAT
         return SolverStatus.SAT
+
+    def _check_with_simplex(self, deadline=None):
+        """Decide an over-cap system with the exact incremental simplex.
+
+        The simplex only reports ``SAT`` after re-checking every constraint against its own
+        witness, so a bug can cost completeness but never soundness.
+        """
+        from .simplex import VexxDualSimplex
+
+        remaining_ms = 5_000 if deadline is None else max(1, int((deadline - time.monotonic()) * 1000))
+        engine = VexxDualSimplex(timeout_ms=remaining_ms)
+        for constraint in self.constraints:
+            op = "lt" if constraint.strict else "le"
+            engine.assert_and_track((op, dict(constraint.coeffs), constraint.rhs), constraint.tracker)
+        status = engine.check()
+        if status == SolverStatus.SAT:
+            self._last_model = {k: Fraction(v) for k, v in engine.get_model().items()}
+            self._last_status = SolverStatus.SAT
+            return SolverStatus.SAT
+        if status == SolverStatus.UNSAT:
+            self._last_core = engine.get_unsat_core()
+            self.core_is_minimal = False
+            self._last_status = SolverStatus.UNSAT
+            return SolverStatus.UNSAT
+        return self._unknown(f"simplex: {engine.unknown_reason}")
 
     def _unknown(self, reason):
         self.unknown_reason = reason

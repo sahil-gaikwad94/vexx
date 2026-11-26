@@ -98,6 +98,12 @@ impl PyVocabularyTrie {
         self.inner.mask_bitset(prefix, eos.as_deref())
     }
 
+    /// Exact mask with the same verdict as `allowed_tokens`, but without re-marshalling the
+    /// vocabulary across the Python boundary on every decoding step.
+    fn mask_exact(&self, prefix: &str) -> Vec<u32> {
+        self.inner.mask_exact(prefix)
+    }
+
     /// Number of `u64` words `mask_bitset` returns.
     fn bitset_words(&self) -> usize {
         self.inner.bitset_words()

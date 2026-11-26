@@ -10,9 +10,10 @@ a hard firewall for structured outputs.  Two enforcement levels, chosen per requ
 
 * **streaming** (``stream: true``): token chunks flow straight through (the proxy cannot
   un-emit tokens).  When the upstream finishes, the proxy verifies the accumulated document
-  and injects a final ``data: {"vexx_certificate": {...}}`` event *before* ``[DONE]``;
-  the response carries ``X-Vexx-Verification: pass|fail`` so stream consumers can gate
-  on it programmatically.
+  and injects a final ``data: {"vexx_certificate": {...}}`` event *before* ``[DONE]``.
+  Because SSE headers are sent before the document exists, the verdict cannot be a header:
+  the response carries ``X-Vexx-Verification: deferred`` and the certificate event carries
+  the authoritative ``status`` (``PASS`` / ``FAIL``) plus ``verification: pass|fail``.
 
 Endpoints: ``POST /v1/chat/completions`` (spec-aware), ``GET /v1/models`` (proxy),
 ``GET /healthz``.
@@ -36,7 +37,7 @@ import json
 import sys
 import time
 from collections.abc import Mapping
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlparse
 
@@ -46,6 +47,8 @@ from .serde import spec_digest
 
 _SSE_CONTENT = "text/event-stream"
 _JSON_CONTENT = "application/json"
+#: Refuse oversized request bodies instead of reading them into memory unbounded.
+_MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -127,8 +130,23 @@ def _parse_json_candidate(text: str) -> Any | None:
         return None
 
 
+def _json_safe(value: Any) -> bool:
+    """True when ``value`` survives ``json.dumps`` without a ``default`` hook."""
+    try:
+        json.dumps(value)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
 def _verify_completion(spec: Any, content: str) -> dict[str, Any]:
-    """Verify a completion string against a compiled schema; returns certificate dict."""
+    """Verify a completion string against a compiled schema; returns certificate dict.
+
+    Derived fields are allowed (``derive_missing=True``) because the schema contract is
+    "the document entails a valid instance".  The values the verifier had to derive are
+    recorded under ``derived_fields`` so the certificate states exactly what was checked
+    versus what the client actually sent.
+    """
 
     stamp = {"verified_at": int(time.time()), "spec_digest": spec_digest(spec.spec) if hasattr(spec, "spec") else ""}
     candidate = _parse_json_candidate(content)
@@ -153,6 +171,13 @@ def _verify_completion(spec: Any, content: str) -> dict[str, Any]:
         "violations": [o.text for o in report.violations] if report.violations else [],
         "unsat_core": list(report.unsat_core),
     }
+    if report.status == "PASS" and isinstance(candidate, Mapping):
+        derived = {
+            key: value for key, value in report.values.items()
+            if key not in candidate and _json_safe(value)
+        }
+        if derived:
+            cert["derived_fields"] = derived
     if report.status == "PASS":
         try:
             proof = build_certificate(spec.spec, report.values, metadata={"proxy": "vexx serve"})
@@ -174,6 +199,24 @@ def _upstream_parts(upstream: str) -> tuple[str, int, str]:
     return host, port, base_path
 
 
+def _open_upstream(upstream: str, timeout: float = 300.0) -> tuple[http.client.HTTPConnection, str]:
+    """Open an HTTP *or* HTTPS upstream.
+
+    Both chat paths used to hardcode ``http.client.HTTPConnection``, which silently broke
+    every real provider (OpenAI, Groq, Together, OpenRouter all serve ``https://``).
+    """
+    parsed = urlparse(upstream if "://" in upstream else f"http://{upstream}")
+    scheme = (parsed.scheme or "http").lower()
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or (443 if scheme == "https" else 80)
+    base_path = parsed.path.rstrip("/")
+    if scheme == "https":
+        connection: http.client.HTTPConnection = http.client.HTTPSConnection(host, port, timeout=timeout)
+    else:
+        connection = http.client.HTTPConnection(host, port, timeout=timeout)
+    return connection, base_path
+
+
 def _stream_chat(handler: _Handler, upstream: str, payload: dict[str, Any], api_key: str | None, spec_name: str | None):
     """Forward an SSE request, buffer the document, inject the certificate before DONE.
 
@@ -181,8 +224,7 @@ def _stream_chat(handler: _Handler, upstream: str, payload: dict[str, Any], api_
     to delimit the streamed body and blocks forever.
     """
 
-    host, port, base_path = _upstream_parts(upstream)
-    connection = http.client.HTTPConnection(host, port, timeout=300)
+    connection, base_path = _open_upstream(upstream)
     path = f"{base_path}/chat/completions"
     headers = {"Content-Type": "application/json", "Accept": _SSE_CONTENT}
     effective_key = api_key or payload.get("api_key_hint")
@@ -213,6 +255,8 @@ def _stream_chat(handler: _Handler, upstream: str, payload: dict[str, Any], api_
     handler.send_header("Content-Type", _SSE_CONTENT)
     handler.send_header("Cache-Control", "no-cache")
     handler.send_header("Transfer-Encoding", "chunked")
+    # The verdict is knowable only after the last token; the certificate event carries it.
+    handler.send_header("X-Vexx-Verification", "deferred" if spec_name else "disabled")
     handler.end_headers()
 
     def _write_chunk(data: bytes) -> None:
@@ -253,7 +297,11 @@ def _stream_chat(handler: _Handler, upstream: str, payload: dict[str, Any], api_
         _, spec = registry.get(spec_name)
         cert = _verify_completion(spec, accumulated) if spec is not None else None
     if cert is not None:
-        _write_chunk(f"data: {json.dumps({'vexx_certificate': cert}, default=str)}\n\n".encode())
+        event = {
+            "vexx_certificate": cert,
+            "verification": "pass" if cert.get("status") == "PASS" else "fail",
+        }
+        _write_chunk(f"data: {json.dumps(event, default=str)}\n\n".encode())
     # One terminator, always after the certificate.
     _write_chunk(b"data: [DONE]\n\n")
     handler.wfile.write(b"0\r\n\r\n")
@@ -262,8 +310,7 @@ def _stream_chat(handler: _Handler, upstream: str, payload: dict[str, Any], api_
 
 
 def _buffered_chat(handler: _Handler, upstream: str, payload: dict[str, Any], api_key: str | None, spec_name: str | None, enforce: bool):
-    host, port, base_path = _upstream_parts(upstream)
-    connection = http.client.HTTPConnection(host, port, timeout=300)
+    connection, base_path = _open_upstream(upstream)
     path = f"{base_path}/chat/completions"
     headers = {"Content-Type": "application/json", "Accept": _JSON_CONTENT}
     effective_key = api_key
@@ -279,6 +326,16 @@ def _buffered_chat(handler: _Handler, upstream: str, payload: dict[str, Any], ap
     upstream_resp = connection.getresponse()
     raw = upstream_resp.read()
     connection.close()
+    if upstream_resp.status != 200:
+        # Preserve provider failures verbatim.  Re-labelling a 429/500 as 200 because its
+        # body happened to be JSON hid rate limits and upstream outages from the client.
+        handler.send_response(upstream_resp.status)
+        handler.send_header("Content-Type", _JSON_CONTENT)
+        handler.send_header("X-Vexx-Verification", "upstream-error")
+        handler.send_header("Content-Length", str(len(raw)))
+        handler.end_headers()
+        handler.wfile.write(raw)
+        return
     try:
         parsed = json.loads(raw) if raw else None
     except json.JSONDecodeError:
@@ -320,8 +377,11 @@ def _buffered_chat(handler: _Handler, upstream: str, payload: dict[str, Any], ap
                 handler.end_headers()
                 handler.wfile.write(payload_bytes)
                 return
-            parsed = {**parsed, "vexx_certificate": cert}
-            raw = json.dumps(parsed).encode("utf-8")
+            # Monitor mode: ``parsed`` may be ``None`` when the upstream body was not JSON.
+            # ``{**None}`` raised a TypeError and killed the response.
+            if isinstance(parsed, dict):
+                parsed = {**parsed, "vexx_certificate": cert}
+                raw = json.dumps(parsed).encode("utf-8")
     handler.send_response(upstream_resp.status if parsed is None else 200)
     handler.send_header("Content-Type", _JSON_CONTENT)
     handler.send_header("X-Vexx-Verification", "monitor" if spec_name else "disabled")
@@ -363,8 +423,7 @@ class _Handler(BaseHTTPRequestHandler):
             })
             return
         if self.path.startswith("/v1/models"):
-            host, port, base_path = _upstream_parts(self.server.vexx_upstream)  # type: ignore[attr-defined]
-            connection = http.client.HTTPConnection(host, port, timeout=30)
+            connection, base_path = _open_upstream(self.server.vexx_upstream, timeout=30)  # type: ignore[attr-defined]
             try:
                 connection.request("GET", f"{base_path}/models", headers=self._forward_headers())
                 upstream_resp = connection.getresponse()
@@ -394,6 +453,13 @@ class _Handler(BaseHTTPRequestHandler):
             return
         try:
             length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._json_reply(400, {"error": {"type": "invalid_json"}})
+            return
+        if length < 0 or length > _MAX_REQUEST_BYTES:
+            self._json_reply(413, {"error": {"type": "request_too_large", "limit": _MAX_REQUEST_BYTES}})
+            return
+        try:
             raw_body = self.rfile.read(length)
             payload = json.loads(raw_body) if raw_body else {}
         except (ValueError, json.JSONDecodeError):
@@ -406,6 +472,14 @@ class _Handler(BaseHTTPRequestHandler):
         # Spec selection: top-level or extra_body.vexx_spec.
         extra = payload.get("extra_body") if isinstance(payload.get("extra_body"), Mapping) else {}
         spec_name = payload.get("vexx_spec") or extra.get("vexx_spec") or getattr(self.server, "vexx_default_spec", None)
+        registry = getattr(self.server, "vexx_registry", None)
+        if spec_name and registry is not None and registry.specs and spec_name not in registry.specs:
+            # Silently verifying against the *default* schema would return a PASS for a
+            # different contract than the caller asked for.
+            self._json_reply(400, {
+                "error": {"type": "unknown_spec", "spec": spec_name, "available": sorted(registry.specs)}
+            })
+            return
         enforce = bool(getattr(self.server, "vexx_enforce", True))
         api_key = payload.pop("vexx_api_key", None) or getattr(self.server, "vexx_api_key", None)
         # Never forward the Vexx-specific keys upstream.
@@ -425,12 +499,9 @@ class _Handler(BaseHTTPRequestHandler):
             self._json_reply(502, {"error": {"type": "upstream_unavailable", "message": str(exc)}})
 
 
-# NOTE on threading: the historical default (one thread per connection) works fine, but
-# single-threaded handling is dramatically more robust on constrained interpreters (a hard
-# kill in a background thread loses buffered responses).  Structured-output verification is
-# a short-lived request/response workload, so requests are handled in order.  Embedding in a
-# threaded server is as simple as passing `server_class=ThreadingHTTPServer`.
-class VexxServeServer(HTTPServer):
+# Concurrent requests must not queue behind one long streaming completion, so the server is
+# threaded.  ``daemon_threads`` keeps shutdown prompt.
+class VexxServeServer(ThreadingHTTPServer):
     def __init__(self, server_address, handler):
         self.vexx_upstream = None
         self.vexx_registry = None

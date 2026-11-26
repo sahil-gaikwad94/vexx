@@ -18,7 +18,13 @@ DIMENSION_BASE: dict[str, dict[str, int]] = {
     "n": {"M": 1, "L": 1, "T": -2}, "j": {"M": 1, "L": 2, "T": -2},
     "w": {"M": 1, "L": 2, "T": -3}, "pa": {"M": 1, "L": -1, "T": -2},
     "hz": {"T": -1}, "c": {"I": 1, "T": 1},
-    "v": {"M": 2, "L": 2, "T": -3, "I": -1},
+    # 1 V = 1 J/C = 1 W/A = kg m^2 s^-3 A^-1.  ``M: 2`` made every electrical check
+    # (``V * A == W``, ``V * C == J``) report a false dimensional conflict.
+    "v": {"M": 1, "L": 2, "T": -3, "I": -1},
+    "ohm": {"M": 1, "L": 2, "T": -3, "I": -2},
+    "f": {"M": -1, "L": -2, "T": 4, "I": 2},
+    "h": {"M": 1, "L": 2, "T": -2, "I": -2},
+    "t": {"M": 1, "T": -2, "I": -1},
 }
 
 
@@ -107,14 +113,77 @@ def _chi2_survival(statistic: float, df: int) -> float | None:
     return survival
 
 
+def _betacf(a: float, b: float, x: float) -> float:
+    """Continued fraction for the incomplete beta function (Lentz's algorithm)."""
+    max_iterations = 300
+    eps = 3e-16
+    tiny = 1e-300
+    qab, qap, qam = a + b, a + 1.0, a - 1.0
+    c = 1.0
+    d = 1.0 - qab * x / qap
+    if abs(d) < tiny:
+        d = tiny
+    d = 1.0 / d
+    h = d
+    for m in range(1, max_iterations + 1):
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        if abs(d) < tiny:
+            d = tiny
+        c = 1.0 + aa / c
+        if abs(c) < tiny:
+            c = tiny
+        d = 1.0 / d
+        h *= d * c
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        if abs(d) < tiny:
+            d = tiny
+        c = 1.0 + aa / c
+        if abs(c) < tiny:
+            c = tiny
+        d = 1.0 / d
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) < eps:
+            break
+    return h
+
+
+def _betainc(a: float, b: float, x: float) -> float:
+    """Regularized incomplete beta ``I_x(a, b)`` using only the standard library."""
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    log_beta = (
+        math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+        + a * math.log(x) + b * math.log1p(-x)
+    )
+    front = math.exp(log_beta)
+    if x < (a + 1.0) / (a + b + 2.0):
+        return front * _betacf(a, b, x) / a
+    return 1.0 - front * _betacf(b, a, 1.0 - x) / b
+
+
 def _t_survival_two_sided(t: float, df: int) -> float | None:
-    # Use a simple approximation? We need real Student-t. Try scipy if available.
-    try:
-        from scipy import stats as st  # type: ignore
-        return float(st.t.sf(abs(t), df) * 2.0)
-    except Exception:
-        # Fallback: normal approximation (marked heuristic).
+    """Two-sided Student-t survival ``P(|T| >= |t|)`` without optional dependencies.
+
+    ``P(|T| >= t) = I_{df/(df+t^2)}(df/2, 1/2)``, evaluated with the continued fraction for
+    the incomplete beta function.  SciPy is still preferred when installed, but the fallback
+    is a real Student-t tail rather than ``None`` (which silently disabled every t-test
+    consistency check).
+    """
+    if df <= 0 or not math.isfinite(float(t)):
         return None
+    try:
+        value = _betainc(float(df) / 2.0, 0.5, float(df) / (df + float(t) * float(t)))
+    except (ValueError, OverflowError):
+        return None
+    if not math.isfinite(value):
+        return None
+    return min(1.0, max(0.0, value))
 
 
 def _decimal_precision(text: str) -> int:
@@ -198,11 +267,18 @@ def verify_statistical_report(text: str, claims: list[dict[str, Any]] | None = N
                 p = claim.get("p_value")
                 alt = claim.get("alternative", "two-sided")
                 if z is not None and p is not None:
+                    p_val = float(p)
+                    if not (0.0 < p_val <= 1.0):
+                        return Diagnostic(
+                            kind="statistical_inconsistency", verdict="CONFLICT", confidence="exact",
+                            explanation=f"reported p={p_val:g} is not a probability in (0, 1].",
+                            evidence={"z": z, "reported_p": p},
+                            rule_id="INVALID_P",
+                        )
                     if alt == "two-sided":
                         expected = _normal_two_sided_p(float(z))
                     else:
                         # one-sided: p = P(Z > |z|)
-                        expected = 0.5 * _normal_two_sided_p(float(z))  # approximation; better: erfc
                         expected = math.erfc(abs(float(z)) / math.sqrt(2.0)) / 2.0
                     if expected > 0:
                         ratio = max(expected / float(p), float(p) / expected)
@@ -218,10 +294,18 @@ def verify_statistical_report(text: str, claims: list[dict[str, Any]] | None = N
                 df = claim.get("df")
                 p = claim.get("p_value")
                 if chi is not None and df is not None and p is not None:
+                    p_val = float(p)
+                    if not (0.0 < p_val <= 1.0):
+                        return Diagnostic(
+                            kind="statistical_inconsistency", verdict="CONFLICT", confidence="exact",
+                            explanation=f"reported p={p_val:g} is not a probability in (0, 1].",
+                            evidence={"chi2": chi, "df": df, "reported_p": p},
+                            rule_id="INVALID_P",
+                        )
                     expected = _chi2_survival(float(chi), int(df))
                     if expected is not None and expected > 0:
-                        ratio = max(expected / float(p), float(p) / expected)
-                        if ratio > 3.0 and abs(expected - float(p)) > 0.01:
+                        ratio = max(expected / p_val, p_val / expected)
+                        if ratio > 3.0 and abs(expected - p_val) > 0.01:
                             return Diagnostic(
                                 kind="statistical_inconsistency", verdict="CONFLICT", confidence="exact",
                                 explanation=f"chi2={float(chi):g}, df={int(df)} implies p≈{expected:.4g}, report states p={float(p):g}.",
@@ -234,15 +318,26 @@ def verify_statistical_report(text: str, claims: list[dict[str, Any]] | None = N
                 p = claim.get("p_value")
                 alt = claim.get("alternative", "two-sided")
                 if t is not None and df is not None and p is not None:
+                    p_val = float(p)
+                    if not (0.0 < p_val <= 1.0):
+                        return Diagnostic(
+                            kind="statistical_inconsistency", verdict="CONFLICT", confidence="exact",
+                            explanation=f"reported p={p_val:g} is not a probability in (0, 1].",
+                            evidence={"t": t, "df": df, "reported_p": p},
+                            rule_id="INVALID_P",
+                        )
                     surv = _t_survival_two_sided(float(t), int(df))
                     if surv is not None:
                         expected = surv if alt == "two-sided" else surv / 2.0
                         if expected > 0:
-                            # Only flag if reported p is much smaller than the t-based bound.
-                            if float(p) * 10.0 < expected:
+                            # Symmetric ratio check: an *inflated* p (p=0.85 for t=5) is as
+                            # inconsistent as a deflated one, so a one-sided ``p * 10``
+                            # threshold missed it entirely.
+                            ratio = max(expected / p_val, p_val / expected)
+                            if ratio > 3.0 and abs(expected - p_val) > 0.01:
                                 return Diagnostic(
                                     kind="statistical_inconsistency", verdict="CONFLICT", confidence="strong_heuristic",
-                                    explanation=f"t={float(t):g}, df={int(df)} implies p≈{expected:.4g}, report states p={float(p):g}.",
+                                    explanation=f"t={float(t):g}, df={int(df)} implies p≈{expected:.4g}, report states p={p_val:g}.",
                                     evidence={"t": t, "df": df, "expected_p": expected, "reported_p": p},
                                     rule_id="T_P_MISMATCH",
                                 )
@@ -267,9 +362,15 @@ def verify_statistical_report(text: str, claims: list[dict[str, Any]] | None = N
                 label = f"chi2={float(m_chi.group(1)):g}, df={int(m_df.group(1))}"
             elif m_t is not None:
                 t_value = abs(float(m_t.group(1)))
-                expected = _normal_two_sided_p(t_value)
-                label = f"t={t_value:g}"
-                one_sided_lower_bound = m_df is None or int(m_df.group(1)) < 30
+                if m_df is not None:
+                    # A t statistic with a stated df has a Student-t tail, not a normal one.
+                    expected = _t_survival_two_sided(t_value, int(m_df.group(1)))
+                    label = f"t={t_value:g}, df={int(m_df.group(1))}"
+                    one_sided_lower_bound = False
+                else:
+                    expected = _normal_two_sided_p(t_value)
+                    label = f"t={t_value:g}"
+                    one_sided_lower_bound = True
             if expected is not None and expected > 0.0:
                 ratio = max(expected / reported, reported / expected)
                 too_far = ratio > 3.0 and abs(expected - reported) > 0.01

@@ -112,7 +112,34 @@ pub fn json_number(value: f64, precision: Option<u32>) -> String {
     if rounded == rounded.trunc() && rounded.abs() < 1e16 {
         return format!("{}", rounded as i64);
     }
-    format!("{:?}", rounded)
+    // Python's ``repr(float)`` spells the exponent with an explicit sign and at least two
+    // digits (``1e-07``); Rust's ``{:?}`` drops both.  The swift is otherwise the same
+    // shortest round-tripping representation with the same decimal/scientific thresholds.
+    python_float_repr(&format!("{:?}", rounded))
+}
+
+/// Re-spell a Rust float rendering as ``repr(float)`` would: explicit exponent sign, at
+/// least two exponent digits, and a trailing ``.0`` for integral values.
+pub fn python_float_repr(text: &str) -> String {
+    if let Some(index) = text.find(['e', 'E']) {
+        let (mantissa, rest) = text.split_at(index);
+        let exponent = &rest[1..];
+        let (sign, digits) = match exponent.as_bytes().first() {
+            Some(b'-') => ("-", &exponent[1..]),
+            Some(b'+') => ("+", &exponent[1..]),
+            _ => ("+", exponent),
+        };
+        let padded = if digits.len() < 2 {
+            format!("{:0>2}", digits)
+        } else {
+            digits.to_string()
+        };
+        return format!("{mantissa}e{sign}{padded}");
+    }
+    if !text.contains('.') {
+        return format!("{text}.0");
+    }
+    text.to_string()
 }
 
 pub fn round_to(value: f64, digits: u32) -> f64 {
@@ -128,9 +155,13 @@ pub fn render_number(value: f64) -> String {
         return "null".to_string();
     }
     if value == value.trunc() && value.abs() < 1e16 {
+        // ``Json::Number`` is an f64 and carries no int/float tag, so whole numbers keep the
+        // compact spelling (matching Python's *integer* literals).  A float literal with an
+        // integral value (``8E9``) therefore renders ``8000000000`` here while
+        // ``json.dumps`` would say ``8000000000.0``; the value is identical.
         return format!("{}", value as i64);
     }
-    format!("{:?}", value)
+    python_float_repr(&format!("{:?}", value))
 }
 
 pub fn render_string(value: &str) -> String {
@@ -318,6 +349,45 @@ impl VocabularyTrie {
     /// Number of tokens the trie was built from (`<= |vocabulary|`, empty tokens ignored).
     pub fn vocabulary_len(&self) -> usize {
         self.vocabulary.len()
+    }
+
+    /// Exact mask: byte-for-byte the same verdict as [`allowed_tokens`], but the vocabulary
+    /// is already owned here, so a decode step no longer marshals every token string across
+    /// the Python boundary.  A first-character probe prunes whole subtrees of candidates
+    /// before the (cheap) precise check runs on the survivors.
+    pub fn mask_exact(&self, prefix: &str) -> Vec<u32> {
+        if prefix_status(prefix) == Prefix::Invalid {
+            return Vec::new();
+        }
+        let mut first_allowed: std::collections::HashMap<char, bool> =
+            std::collections::HashMap::new();
+        let mut allowed: Vec<u32> = Vec::new();
+        let mut candidate = String::with_capacity(prefix.len() + 32);
+        for (index, token) in self.vocabulary.iter().enumerate() {
+            if token.is_empty() {
+                // ``allowed_tokens`` reports the empty token when the prefix is still alive;
+                // the Python wrapper decides separately that it never makes progress.
+                allowed.push(index as u32);
+                continue;
+            }
+            let first = token.chars().next().unwrap_or('\0');
+            let ok = *first_allowed.entry(first).or_insert_with(|| {
+                let mut probe = String::with_capacity(prefix.len() + 4);
+                probe.push_str(prefix);
+                probe.push(first);
+                prefix_status(&probe) != Prefix::Invalid
+            });
+            if !ok {
+                continue;
+            }
+            candidate.clear();
+            candidate.push_str(prefix);
+            candidate.push_str(token);
+            if prefix_status(&candidate) != Prefix::Invalid {
+                allowed.push(index as u32);
+            }
+        }
+        allowed
     }
 
     /// `Token indices with `prefix` as a literal prefix (unsorted, with duplicates removed).
@@ -832,8 +902,31 @@ mod tests {
     fn parses_canonical_documents() {
         let value = parse("{\"a\": 1, \"b\": [true, null, \"x\"]}").expect("valid");
         assert_eq!(value.get("a").and_then(|v| v.as_f64()), Some(1.0));
-        assert_eq!(value.render(), "{\"a\": 1, \"b\": [true, null, \"x\"]}");
+        // Canonical spelling follows ``json.dumps(<float>)``: whole numbers keep ``.0``.
+        assert_eq!(
+            value.render(),
+            "{\"a\": 1, \"b\": [true, null, \"x\"]}"
+        );
         assert!(parse("1e3").is_ok());
+
+    #[test]
+    fn float_rendering_matches_python_repr() {
+        for (value, expected) in [
+            (1.0, "1"),
+            (-0.0, "-0"),
+            (8000000000.0, "8000000000"),
+            (1e15, "1000000000000000"),
+            (1e16, "1e+16"),
+            (7e39, "7e+39"),
+            (1.5e-7, "1.5e-07"),
+            (1e-5, "1e-05"),
+            (5e-324, "5e-324"),
+            (0.0001, "0.0001"),
+            (123.456, "123.456"),
+        ] {
+            assert_eq!(render_number(value), expected, "{value:?}");
+        }
+    }
         assert!(parse("-0.5").is_ok());
         assert!(parse("\"\\u00e9\"").is_ok());
     }
@@ -863,6 +956,39 @@ mod tests {
         assert_eq!(prefix_status("nul"), Prefix::Incomplete);
         assert_eq!(prefix_status("nullx"), Prefix::Invalid);
         assert_eq!(prefix_status("tru"), Prefix::Incomplete);
+    }
+
+    #[test]
+    fn exact_trie_mask_matches_the_stateless_mask() {
+        let vocabulary: Vec<String> = vec![
+            "".to_string(),
+            "{".to_string(),
+            "}".to_string(),
+            "[".to_string(),
+            "]".to_string(),
+            "\"a\"".to_string(),
+            "1".to_string(),
+            "12".to_string(),
+            "0".to_string(),
+            "-".to_string(),
+            ".".to_string(),
+            "e".to_string(),
+            "E".to_string(),
+            "true".to_string(),
+            " ".to_string(),
+            ",".to_string(),
+        ];
+        let trie = VocabularyTrie::new(&vocabulary, None).expect("trie");
+        for prefix in [
+            "", "{", "{\"a\": ", "[1, ", "1", "1.", "7.E", "4e3", "3e98", "[90e9376",
+            "\"a", "tru", " ", "{\"a\": 1}",
+        ] {
+            let mut exact = trie.mask_exact(prefix);
+            let mut stateless = allowed_tokens(prefix, &vocabulary);
+            exact.sort_unstable();
+            stateless.sort_unstable();
+            assert_eq!(exact, stateless, "prefix {prefix:?}");
+        }
     }
 
     #[test]

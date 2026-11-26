@@ -110,10 +110,19 @@ class LexerState:
     ``closed_frames`` reports only the frames closed while scanning the most recent
     chunk, which is exactly what a token-closing candidate needs.
 
+    ``stack_meta`` / ``closed_meta`` are parallel bookkeeping for each frame: whether the
+    argument list saw content, a ``*``/``**`` unpacking, a keyword ``=`` or a trailing
+    comma.  That makes argument-shape checks exact without slicing source text backwards
+    from a ``)`` — the previous approach grabbed the *inner* ``(`` on nested calls such as
+    ``foo(bar(1), 2)`` and miscounted the outer call.
+
     ``fstring_stack`` tracks nested replacement fields inside an f-string.  Each entry
     is the delimiter stack (``[...]``) that was open when the field started, so a ``}``
     that closes a replacement field restores the correct outer context instead of being
     mistaken for a dict close.
+
+    ``ident_closed`` records that whitespace ended the identifier, so ``return helper(``
+    records the callee ``helper`` instead of the concatenation ``returnhelper``.
     """
 
     valid: bool = True
@@ -128,7 +137,12 @@ class LexerState:
     #: Quote that would end the string literal currently being scanned.
     stack: list[tuple[str, str | None, int]] = field(default_factory=list)
     closed_frames: list[tuple[str, str | None, int]] = field(default_factory=list)
+    #: Parallel to ``stack`` / ``closed_frames``: argument-shape bookkeeping per frame.
+    stack_meta: list[dict[str, bool]] = field(default_factory=list)
+    closed_meta: list[dict[str, bool]] = field(default_factory=list)
     last_ident: str = ""
+    #: True once whitespace (or any non-identifier character) ended ``last_ident``.
+    ident_closed: bool = False
     prev_non_ws: str = ""
     last_line: str = ""
     #: Text carried over from a chunk that ended mid string-opener.
@@ -164,7 +178,10 @@ class LexerState:
             nested_string_stack=list(self.nested_string_stack),
             stack=list(self.stack),
             closed_frames=[],
+            stack_meta=[dict(m) for m in self.stack_meta],
+            closed_meta=[],
             last_ident=self.last_ident,
+            ident_closed=self.ident_closed,
             prev_non_ws=self.prev_non_ws,
             last_line=self.last_line,
             pending=self.pending,
@@ -201,7 +218,10 @@ def _close_frame(st: LexerState, ch: str) -> bool:
         st.reason = "mismatched_close"
         return False
     st.closed_frames.append(st.stack.pop())
+    if st.stack_meta:
+        st.closed_meta.append(st.stack_meta.pop())
     st.last_ident = ""
+    st.ident_closed = False
     st.prev_non_ws = ch
     st.last_line = (st.last_line + ch)[-256:]
     return True
@@ -212,9 +232,64 @@ def _open_frame(st: LexerState, ch: str) -> None:
     if ch == "(" and st.last_ident and st.last_ident not in CALLEE_KEYWORDS:
         callee = st.last_ident
     st.stack.append((ch, callee, 0))
+    st.stack_meta.append({"saw_content": False, "saw_star": False, "saw_equals": False, "trailing_comma": False})
     st.last_ident = ""
+    st.ident_closed = False
     st.prev_non_ws = ch
     st.last_line = (st.last_line + ch)[-256:]
+
+
+def _note_ident(st: LexerState, ch: str) -> None:
+    """Accumulate an identifier character, starting a new identifier after whitespace."""
+    if ch.isalnum() or ch == "_":
+        if st.ident_closed:
+            st.last_ident = ch
+            st.ident_closed = False
+        else:
+            st.last_ident = (st.last_ident + ch)[-160:]
+    elif ch == ".":
+        if st.last_ident:
+            st.last_ident = (st.last_ident + ".")[-160:]
+            st.ident_closed = False
+    elif ch.isspace():
+        st.ident_closed = True
+    else:
+        st.last_ident = ""
+        st.ident_closed = False
+
+
+def _note_argument(st: LexerState, ch: str) -> None:
+    """Record the argument shape of the innermost open frame."""
+    if not st.stack_meta:
+        return
+    meta = st.stack_meta[-1]
+    if ch == "*":
+        meta["saw_star"] = True
+    elif ch == "=":
+        meta["saw_equals"] = True
+    if ch == ",":
+        meta["trailing_comma"] = True
+        return
+    if not ch.isspace():
+        meta["saw_content"] = True
+        meta["trailing_comma"] = False
+
+
+def _skip_backslash(st: LexerState, text: str, i: int, n: int) -> int:
+    """Index just past a backslash run, honouring raw-string escape semantics.
+
+    In a raw string a backslash still escapes the following quote *for lexing purposes*
+    (``r'it\\'s'`` is one literal), so only an odd-length run consumes the next
+    character; an even run leaves it to close the string.
+    """
+    run = 1
+    while i + run < n and text[i + run] == "\\":
+        run += 1
+    if st.raw_str:
+        if run % 2 == 1:
+            return i + run + 1 if i + run < n else i + run
+        return i + run
+    return i + 2 if i + 1 < n else i + 1
 
 
 def _scan_chars(st: LexerState, text: str, limit: int) -> int:
@@ -256,8 +331,8 @@ def _scan_chars(st: LexerState, text: str, limit: int) -> int:
                 st.valid = False
                 st.reason = "unmatched_close"
                 break
-            if ch == "\\" and not st.raw_str and i + 1 < n:
-                i += 2
+            if ch == "\\":
+                i = _skip_backslash(st, text, i, n)
                 continue
             if text.startswith(st.in_str, i):
                 i += len(st.in_str)
@@ -270,10 +345,49 @@ def _scan_chars(st: LexerState, text: str, limit: int) -> int:
 
         # ------------------------------------------- f-string expression body
         if st.fstring_stack:
+            if st.in_str is not None and _is_fstring(st.in_str, st.f_mode):
+                # An f-string nested inside a replacement field (PEP 701).  Its own
+                # replacement fields must be parsed, so a ``{`` pushes another frame
+                # instead of being read as string content.
+                if ch == "{":
+                    if i + 1 < n and text[i + 1] == "{":
+                        i += 2
+                        continue
+                    st.fstring_stack.append((list(st.stack), st.in_str, st.raw_str, st.f_mode))
+                    st.stack = []
+                    st.stack_meta = []
+                    st.in_str = None
+                    st.f_mode = False
+                    st.raw_str = False
+                    st.last_ident = ""
+                    st.ident_closed = False
+                    i += 1
+                    continue
+                if ch == "}":
+                    if i + 1 < n and text[i + 1] == "}":
+                        i += 2
+                        continue
+                    st.valid = False
+                    st.reason = "unmatched_close"
+                    break
+                if ch == "\\":
+                    i = _skip_backslash(st, text, i, n)
+                    continue
+                if text.startswith(st.in_str, i):
+                    i += len(st.in_str)
+                    if st.nested_string_stack:
+                        st.in_str, st.raw_str, st.f_mode = st.nested_string_stack.pop()
+                    else:
+                        st.in_str = None
+                        st.f_mode = False
+                        st.raw_str = False
+                    continue
+                i += 1
+                continue
             if st.in_str is not None:
                 # Nested string literal inside the replacement field (PEP 701).
-                if ch == "\\" and i + 1 < n:
-                    i += 2
+                if ch == "\\":
+                    i = _skip_backslash(st, text, i, n)
                     continue
                 if text.startswith(st.in_str, i):
                     i += len(st.in_str)
@@ -290,6 +404,12 @@ def _scan_chars(st: LexerState, text: str, limit: int) -> int:
                 # Only a ``}`` at the field's own nesting level closes the field.
                 fs, quote, raw, fm = st.fstring_stack.pop()
                 st.stack = fs
+                # Rebuild the parallel argument bookkeeping for the restored frames; the
+                # suspended stack is empty for a replacement field.
+                st.stack_meta = [
+                    {"saw_content": False, "saw_star": False, "saw_equals": False, "trailing_comma": False}
+                    for _ in fs
+                ]
                 st.in_str = quote
                 st.raw_str = raw
                 st.f_mode = fm
@@ -325,13 +445,13 @@ def _scan_chars(st: LexerState, text: str, limit: int) -> int:
             if ch == "," and st.stack:
                 delim, call, count = st.stack[-1]
                 st.stack[-1] = (delim, call, count + 1)
+                _note_argument(st, ch)
                 st.last_ident = ""
+                st.ident_closed = False
                 i += 1
                 continue
-            if ch.isalnum() or ch in "_.":
-                st.last_ident = (st.last_ident + ch)[-160:]
-            elif not ch.isspace():
-                st.last_ident = ""
+            _note_argument(st, ch)
+            _note_ident(st, ch)
             if ch == "\n":
                 st.last_line = ""
             else:
@@ -343,12 +463,14 @@ def _scan_chars(st: LexerState, text: str, limit: int) -> int:
 
         # ------------------------------------------------- ordinary string
         if st.in_str is not None:
-            if ch == "\n" and not st.raw_str and isinstance(st.in_str, str) and len(st.in_str) == 1:
+            # A literal newline terminates any single-quoted string, raw or not:
+            # ``r'a<newline>b'`` is a SyntaxError in Python.
+            if ch == "\n" and isinstance(st.in_str, str) and len(st.in_str) == 1:
                 st.valid = False
                 st.reason = "unterminated_string_literal"
                 break
-            if ch == "\\" and i + 1 < n:
-                i += 2
+            if ch == "\\":
+                i = _skip_backslash(st, text, i, n)
                 continue
             if text.startswith(st.in_str, i):
                 i += len(st.in_str)
@@ -388,14 +510,14 @@ def _scan_chars(st: LexerState, text: str, limit: int) -> int:
         if ch == "," and st.stack:
             delim, call, count = st.stack[-1]
             st.stack[-1] = (delim, call, count + 1)
+            _note_argument(st, ch)
             st.last_ident = ""
+            st.ident_closed = False
             i += 1
             continue
 
-        if ch.isalnum() or ch in "_.":
-            st.last_ident = (st.last_ident + ch)[-160:]
-        elif not ch.isspace():
-            st.last_ident = ""
+        _note_argument(st, ch)
+        _note_ident(st, ch)
 
         if ch == "\n":
             st.last_line = ""
@@ -417,6 +539,7 @@ def _enter_string(st: LexerState, match: re.Match[str], position: int) -> None:
     # The prefix (``f``, ``rb``, ...) was just consumed as part of the opener, so it
     # must not linger in ``last_ident`` and be mistaken for a callable name.
     st.last_ident = ""
+    st.ident_closed = False
 
 
 def _split_string_prefix(st: LexerState) -> str:
@@ -443,9 +566,14 @@ def advance_lexer_state(state: LexerState, chunk: str, *, reset_closed: bool = T
         return st
 
     text = (st.pending + chunk) if st.pending else chunk
-    # A dangling string prefix from the previous chunk (``f`` with the quote still to
-    # come) is part of the text being decided, so it must survive into the rewind state.
-    carry_prefix = _split_string_prefix(st)
+    # A dangling string prefix (``f`` with the quote still to come) may only be consumed
+    # when this chunk actually starts the quote.  Unconditionally popping a single-letter
+    # identifier emptied ``last_ident`` for ordinary code such as ``"def f"`` + ``"(x):"``.
+    carry_prefix = _split_string_prefix(st) if chunk[:1] in ("'", '"') else ""
+    if carry_prefix:
+        # Re-scan the prefix together with the quote so the opener keeps its flags
+        # (``f`` must still produce an f-string) without leaving it in ``last_ident``.
+        text = carry_prefix + text
     st.pending = ""
 
     # A trailing quote run may still grow into a triple-quoted string, so the scan stops
@@ -474,15 +602,12 @@ def advance_lexer_state(state: LexerState, chunk: str, *, reset_closed: bool = T
     limit = hold if hold >= 0 else len(text)
     consumed = _scan_chars(st, text, limit)
     if hold >= 0 and consumed >= hold:
-        # Carry the undecided tail (and any dangling string prefix) into ``pending``.
+        # Carry the undecided tail into ``pending``; it already contains the prefix.
         st = hold_state if hold_state is not None else st
         st.closed_frames = []
+        st.closed_meta = []
         if st.valid:
-            st.pending = carry_prefix + text[hold:]
-    elif carry_prefix and st.valid:
-        # The prefix did not turn into a string opener after all; keep it as pending so
-        # the next chunk can still complete it.
-        st.pending = carry_prefix
+            st.pending = text[hold:]
     return st
 
 

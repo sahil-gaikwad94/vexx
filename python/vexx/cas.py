@@ -183,7 +183,16 @@ def safe_sympy(expr: str, env: dict[str, Any] | None = None) -> Any:
                         raise ValueError("exponent too large")
                 if isinstance(right, sp.Integer) and abs(int(right)) > _MAX_EXPONENT:
                     raise ValueError("exponent too large")
+                # Both operands being within their own limits is not enough: (2**10000)**10000
+                # allocates a 100-million-bit integer.  Bound the *intermediate* size too.
+                # ``int(right)`` is only meaningful for an integer exponent; a symbolic
+                # exponent (``2**x``) used to raise TypeError out of the safe parser.
+                if isinstance(left, sp.Integer) and isinstance(right, sp.Integer) and int(right) > 0:
+                    if int(left).bit_length() * int(right) > _MAX_INT_BITS:
+                        raise ValueError("intermediate integer too large")
             result = binops[type(node.op)](left, right)
+            if isinstance(result, sp.Integer) and int(result).bit_length() > _MAX_INT_BITS:
+                raise ValueError("intermediate integer too large")
             # Reject zoo/oo/nan numerical results.
             if result.is_number and (result == sp.zoo or result == sp.oo or result == -sp.oo or result == sp.nan):
                 raise ValueError("non-finite result")
@@ -248,10 +257,12 @@ def crane_cas_evaluate(expr_str: str, env: dict[str, Any] | None = None) -> str:
     except OptionalDependencyError:
         raise
     except Exception as exc:
-        msg = str(exc)
-        if "division" in msg.lower() or "zero" in msg.lower():
+        # Substring-matching "zero" misclassified unrelated errors ("modulus must be
+        # non-zero", "zero-width space") as division by zero.
+        msg = str(exc).lower()
+        if "division by zero" in msg or "zero divisor" in msg or "division" == msg.strip():
             return "DIV_BY_ZERO"
-        return f"ERROR: {msg}"
+        return f"ERROR: {exc}"
 
 
 def solve_linear_system(eqs: list[str], vars_list: list[str]) -> dict[str, Any]:
@@ -333,7 +344,17 @@ def integrate_definite(expr_str: str, var_name: str, a: Any, b: Any) -> str:
     expr = safe_sympy(expr_str.replace("^", "**"), {var_name: x})
     lo = safe_sympy(str(a), {})
     hi = safe_sympy(str(b), {})
+    # ``sp.integrate`` has no built-in budget and can run for minutes on a non-elementary
+    # integrand.  Bound the input complexity and the output expression so a generated
+    # candidate cannot turn one call into a denial of service.
+    if sp.count_ops(expr, visual=False) > 200:
+        raise ValueError("expression too complex to integrate")
+    for bound in (lo, hi):
+        if not (bound.is_number or bound in (sp.oo, -sp.oo)):
+            raise ValueError("integration bounds must be numeric")
     val = sp.integrate(expr, (x, lo, hi))
+    if sp.count_ops(val, visual=False) > 500:
+        raise ValueError("antiderivative too complex")
     return str(sp.simplify(val))
 
 

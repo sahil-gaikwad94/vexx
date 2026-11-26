@@ -216,7 +216,15 @@ impl Interval {
         }
         let mut cut: Option<usize> = None;
         for (index, ch) in trimmed.char_indices() {
-            if ch == ',' || ch == '}' || ch == ']' || ch == ' ' || ch == '\n' || ch == '\t' {
+            // ``\r`` is JSON whitespace and terminates a number, exactly like ``\n``.
+            if ch == ','
+                || ch == '}'
+                || ch == ']'
+                || ch == ' '
+                || ch == '\n'
+                || ch == '\t'
+                || ch == '\r'
+            {
                 cut = Some(index);
                 break;
             }
@@ -232,18 +240,53 @@ impl Interval {
             return bounds.intersect(Interval::new(0.0, f64::INFINITY));
         }
         let negative = number_part.starts_with('-');
+        // Reject leading-zero integer prefixes ("00", "-00", "01", "01.5") and non-JSON
+        // spellings ("inf", "nan").  The Python reference rejects them, and the two engines
+        // must agree exactly on which prefixes are dead: accepting "00" when the native
+        // extension is loaded would let the decoder emit invalid JSON.
+        let digits = number_part.trim_start_matches(['-', '+']);
+        let int_part = digits.split(['.', 'e', 'E']).next().unwrap_or("");
+        if int_part.len() > 1
+            && int_part.starts_with('0')
+            && int_part.bytes().all(|b| b.is_ascii_digit())
+        {
+            return Interval::EMPTY;
+        }
+        if digits
+            .bytes()
+            .any(|b| b.is_ascii_alphabetic() && b != b'e' && b != b'E')
+        {
+            return Interval::EMPTY;
+        }
+        if allow_exp && number_part.to_ascii_lowercase().contains('e') {
+            // A scientific-notation prefix is not a point: "1e1" can still become "1e10".
+            // ``float("1e")`` fails in Python, so handling this before the parse keeps the
+            // two engines in step and lets exponent tokens decode at all.
+            let mut parts = number_part.split(['e', 'E']);
+            let mantissa_text = parts.next().unwrap_or("");
+            let exponent_text = parts.next().unwrap_or("");
+            if !valid_mantissa(mantissa_text) || !valid_exponent(exponent_text) {
+                return Interval::EMPTY;
+            }
+            let mantissa = match mantissa_text.parse::<f64>() {
+                Ok(value) if value.is_finite() => value,
+                _ => return Interval::EMPTY,
+            };
+            if closed && !exponent_text.is_empty() {
+                return match number_part.parse::<f64>() {
+                    Ok(value) if value.is_finite() => bounds.intersect(Interval::point(value)),
+                    _ => Interval::EMPTY,
+                };
+            }
+            return exp_prefix_span(mantissa, exponent_text, bounds);
+        }
         let clean = number_part.strip_suffix('.').unwrap_or(number_part);
         let base = match clean.parse::<f64>() {
-            Ok(value) => value,
-            Err(_) => return Interval::EMPTY,
+            Ok(value) if value.is_finite() => value,
+            _ => return Interval::EMPTY,
         };
         if closed {
             return bounds.intersect(Interval::point(base));
-        }
-        if allow_exp && number_part.to_ascii_lowercase().contains('e') {
-            // Exponent literals are handled by the closed-literal path once complete; a
-            // partial exponent cannot narrow the interval.
-            return bounds;
         }
         if number_part.contains('.') {
             let dot = number_part.find('.').unwrap_or(number_part.len());
@@ -302,6 +345,97 @@ impl Interval {
     }
 }
 
+/// JSON mantissa syntax: optional sign, no leading zero, optional fraction.
+fn valid_mantissa(text: &str) -> bool {
+    let body = text.trim_start_matches(['-', '+']);
+    if body.is_empty() {
+        return false;
+    }
+    let mut parts = body.split('.');
+    let integer = parts.next().unwrap_or("");
+    if integer.is_empty() || !integer.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    if integer.len() > 1 && integer.starts_with('0') {
+        return false;
+    }
+    match parts.next() {
+        None => true,
+        Some(fraction) => {
+            !fraction.is_empty()
+                && fraction.bytes().all(|b| b.is_ascii_digit())
+                && parts.next().is_none()
+        }
+    }
+}
+
+/// Exponent syntax: empty, an optional single sign, then digits only.
+fn valid_exponent(text: &str) -> bool {
+    let mut chars = text.chars();
+    match chars.next() {
+        None => true,
+        Some(first) if first == '+' || first == '-' => chars.all(|c| c.is_ascii_digit()),
+        Some(first) => first.is_ascii_digit() && chars.all(|c| c.is_ascii_digit()),
+    }
+}
+
+/// Values reachable by completing a scientific-notation prefix (Python parity).
+fn exp_prefix_span(mantissa: f64, exponent_text: &str, bounds: Interval) -> Interval {
+    if mantissa == 0.0 {
+        return bounds.intersect(Interval::point(0.0));
+    }
+    let mut prefix = exponent_text;
+    let mut negative_exponent = false;
+    if let Some(rest) = prefix.strip_prefix('-') {
+        negative_exponent = true;
+        prefix = rest;
+    } else if let Some(rest) = prefix.strip_prefix('+') {
+        prefix = rest;
+    }
+    let mut matched = false;
+    for exponent in -323i32..=308 {
+        let spelling = if exponent < 0 {
+            if !negative_exponent {
+                continue;
+            }
+            (-exponent).to_string()
+        } else {
+            if negative_exponent {
+                continue;
+            }
+            exponent.to_string()
+        };
+        if !prefix.is_empty() && !spelling.starts_with(prefix) {
+            continue;
+        }
+        let value = mantissa * 10f64.powi(exponent);
+        if !value.is_finite() {
+            continue;
+        }
+        if bounds.lo <= value && value <= bounds.hi {
+            matched = true;
+            break;
+        }
+    }
+    if !matched {
+        // An open exponent can still gain a minus sign and enough digits to underflow to
+        // 0.0 (``"1e"`` -> ``"1e-999"``); that completion is representable, so a domain
+        // containing zero is viable even when the sampled exponents all missed it.
+        let zero_reachable = exponent_text.is_empty() || exponent_text.starts_with('-');
+        if zero_reachable && bounds.lo <= 0.0 && 0.0 <= bounds.hi {
+            matched = true;
+        }
+    }
+    if !matched {
+        return Interval::EMPTY;
+    }
+    if mantissa > 0.0 {
+        bounds.intersect(Interval::new(0.0, f64::INFINITY))
+    } else {
+        bounds.intersect(Interval::new(f64::NEG_INFINITY, 0.0))
+    }
+}
+
 fn mul_point(a: f64, b: f64) -> f64 {
     if (a == 0.0 && b.is_infinite()) || (b == 0.0 && a.is_infinite()) {
         0.0
@@ -320,6 +454,33 @@ mod tests {
         let sum = Interval::new(0.5, 0.5).add(half);
         assert!(sum.contains(1.0));
         assert!(sum.width() < 1e-15);
+    }
+
+    #[test]
+    fn numeric_prefix_rejects_the_same_dead_prefixes_as_python() {
+        let bounds = Interval::new(0.0, 10.0);
+        for dead in ["01.5", "00", "-00", "01", "inf", "NaN", "1e400"] {
+            assert!(
+                Interval::from_numeric_prefix(dead, bounds, true).is_empty(),
+                "{dead} should be dead"
+            );
+        }
+        assert!(!Interval::from_numeric_prefix("1e", Interval::new(0.0, 1000.0), true).is_empty());
+        let big = Interval::new(1e9, 1e11);
+        assert!(!Interval::from_numeric_prefix("1e1", big, true).is_empty());
+        assert!(Interval::from_numeric_prefix("1e2", big, true).is_empty());
+    }
+
+    #[test]
+    fn numeric_prefix_terminators_and_underflow_agree_with_python() {
+        // ``\r`` is JSON whitespace: the literal is closed, so it pins exactly.
+        let closed = Interval::from_numeric_prefix("342\r", Interval::ENTIRE, false);
+        assert_eq!(closed, Interval::point(342.0));
+        // An open negative exponent can underflow to zero, which is representable.
+        let zero = Interval::from_numeric_prefix("1e-", Interval::new(-0.5, 0.0), true);
+        assert!(zero.contains(0.0), "1e- can still become 1e-999 -> 0.0");
+        // An exponent whose sign is already positive cannot reach zero.
+        assert!(Interval::from_numeric_prefix("1e+", Interval::new(-0.5, 0.0), true).is_empty());
     }
 
     #[test]

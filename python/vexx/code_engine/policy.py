@@ -67,10 +67,20 @@ _FRAME_ATTRS = frozenset({
     "gi_suspended", "cr_running", "cr_await",
 })
 
-#: Methods that must never be called on untrusted strings/templates.
-_FORBIDDEN_STRING_METHODS = frozenset({"format", "format_map", "vformat"})
+#: Methods that must never be called on untrusted strings/templates.  ``get_field`` /
+#: ``get_value`` are ``string.Formatter``'s entry points: they walk attribute paths given
+#: as *strings*, so no dunder attribute node ever appears in the AST.
+_FORBIDDEN_STRING_METHODS = frozenset({"format", "format_map", "vformat", "get_field", "get_value"})
+
+#: Attribute names that must never be referenced by generated code.  ``format`` is here
+#: (not just under :data:`_FORBIDDEN_STRING_METHODS`) so that *binding* a format method to a
+#: name — ``f = "{0.__class__}".format; f(x)`` — is rejected at the attribute access.
+_FORBIDDEN_SOFT_ATTRS = frozenset({"format", "format_map", "vformat", "get_field", "get_value", "Formatter"})
 
 #: Attribute names that must never be referenced by generated code.
+#: ``heapq`` used to live here while also being allow-listed for import, so every priority
+#: queue (Dijkstra, A*, k-way merge) was rejected with "forbidden identifier: heapq".  A
+#: name that is allow-listed as an import must never be forbidden as an identifier.
 _FORBIDDEN_IDENTIFIERS_EXT = frozenset({
     "os", "sys", "subprocess", "socket", "shutil", "pathlib", "open",
     "eval", "exec", "compile", "__import__", "globals", "locals",
@@ -81,7 +91,7 @@ _FORBIDDEN_IDENTIFIERS_EXT = frozenset({
     "http", "urllib", "ftplib", "smtplib", "telnetlib", "xmlrpc",
     "pickle", "shelve", "marshal", "dbm", "sqlite3",
     "importlib", "pkgutil", "modulefinder", "runpy", "pdb",
-    "gc", "weakref", "weakrefproxy", "atexit", "copyreg", "reprlib", "enum", "graphlib", "heapq",
+    "gc", "weakref", "weakrefproxy", "atexit", "copyreg", "reprlib", "enum", "graphlib",
 })
 
 
@@ -191,6 +201,7 @@ def check_ast_policy(source: str, policy: CodePolicy | None = None) -> ast.Modul
             node="Module",
         )
     tree = ast.parse(source)
+    forbidden_names = _effective_forbidden(policy)
 
     nodes = 0
     for node in ast.walk(tree):
@@ -210,7 +221,7 @@ def check_ast_policy(source: str, policy: CodePolicy | None = None) -> ast.Modul
         name = _node_name(node)
         if name in policy.forbidden_nodes:
             raise CodePolicyError(f"forbidden AST node: {name}", node=name, line=getattr(node, "lineno", 0))
-        if isinstance(node, ast.Name) and node.id in policy.forbidden_identifiers:
+        if isinstance(node, ast.Name) and node.id in forbidden_names:
             raise CodePolicyError(f"forbidden identifier: {node.id}", node="Name", line=node.lineno)
         if isinstance(node, ast.Attribute):
             if node.attr.startswith("__") or node.attr in _FORBIDDEN_ATTRS:
@@ -225,29 +236,42 @@ def check_ast_policy(source: str, policy: CodePolicy | None = None) -> ast.Modul
                     node="Attribute",
                     line=node.lineno,
                 )
+            # Attribute access itself is rejected (not only a direct call), so an alias
+            # such as ``f = "{0.__class__}".format`` cannot smuggle the method out.
+            if node.attr in _FORBIDDEN_SOFT_ATTRS:
+                raise CodePolicyError(
+                    f"forbidden template attribute: {node.attr}",
+                    node="Attribute",
+                    line=node.lineno,
+                )
         if isinstance(node, ast.Call):
-            # Block str.format / str.format_map on untrusted strings/templates.
+            # Keep the explicit diagnostic for a direct format call.
             func = node.func
-            if isinstance(func, ast.Attribute):
-                if func.attr in _FORBIDDEN_STRING_METHODS:
-                    raise CodePolicyError(
-                        f"forbidden string method: {func.attr}",
-                        node="Call",
-                        line=node.lineno,
-                    )
-            elif isinstance(func, ast.Name) and func.id in _FORBIDDEN_IDENTIFIERS_EXT:
+            if isinstance(func, ast.Attribute) and func.attr in _FORBIDDEN_STRING_METHODS:
+                raise CodePolicyError(
+                    f"forbidden string method: {func.attr}",
+                    node="Call",
+                    line=node.lineno,
+                )
+            if isinstance(func, ast.Name) and func.id in forbidden_names:
                 raise CodePolicyError(
                     f"forbidden identifier: {func.id}",
                     node="Name",
                     line=node.lineno,
                 )
-        if isinstance(node, ast.Name) and node.id in _FORBIDDEN_IDENTIFIERS_EXT:
-            raise CodePolicyError(
-                f"forbidden identifier: {node.id}",
-                node="Name",
-                line=node.lineno,
-            )
     return tree
+
+
+def _effective_forbidden(policy: CodePolicy) -> frozenset[str]:
+    """The forbidden identifier set, minus anything the policy allow-lists for import.
+
+    A module cannot be both importable and an unusable name; keeping the two lists
+    consistent is what made ``import heapq`` fail while ``heapq`` was allow-listed.
+    """
+    allowed = set(policy.allowed_imports)
+    return frozenset(
+        set(policy.forbidden_identifiers) | (set(_FORBIDDEN_IDENTIFIERS_EXT) - allowed)
+    )
 
 
 def parse_and_check(source: str, policy: CodePolicy | None = None) -> ast.Module:

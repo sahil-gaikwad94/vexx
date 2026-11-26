@@ -140,7 +140,10 @@ def prefix_status(text: str) -> str:
     if not machine.feed(text):
         return "invalid"
     probe = machine.clone()
-    probe.finish()
+    if not probe.finish():
+        # ``finish`` fails only for a number the engine cannot represent (non-finite).
+        # Reporting that as "incomplete" would let the decoder keep emitting a dead number.
+        return "invalid"
     return "complete" if probe.accepts() else "incomplete"
 
 
@@ -163,6 +166,36 @@ def canonical_document(text: str) -> str | None:
     return json.dumps(value, ensure_ascii=False)
 
 
+#: Identity-keyed native vocabulary maskers.  Building one converts the vocabulary once;
+#: the tuple pins the sequence so its ``id`` cannot be recycled while cached.
+_MASKER_CACHE: dict[int, tuple[Any, int, Any]] = {}
+_MASKER_MAX = 8
+
+
+def _exact_masker(vocabulary: Sequence[str]):
+    """Cached native masker exposing ``mask_exact``, or ``None`` when unavailable."""
+
+    if not available():
+        return None
+    cls = getattr(_NATIVE, "PyVocabularyTrie", None)
+    if cls is None:
+        return None
+    key = id(vocabulary)
+    entry = _MASKER_CACHE.get(key)
+    if entry is not None and entry[0] is vocabulary and entry[1] == len(vocabulary):
+        return entry[2]
+    try:
+        masker = cls(list(vocabulary), None)
+    except BaseException as error:  # noqa: BLE001 - the accelerator must never break a decode
+        if _never_a_fallback(error):  # pragma: no cover
+            raise
+        return None
+    if len(_MASKER_CACHE) >= _MASKER_MAX:
+        _MASKER_CACHE.pop(next(iter(_MASKER_CACHE)), None)
+    _MASKER_CACHE[key] = (vocabulary, len(vocabulary), masker)
+    return masker
+
+
 def mask_or_none(
     prefix: str,
     vocabulary: Sequence[str],
@@ -179,7 +212,29 @@ def mask_or_none(
         allowed = _NATIVE.prefix_status(prefix)
         if allowed == "invalid":
             return None
-        indices = set(_NATIVE.allowed_tokens(prefix, list(vocabulary), None))
+        indices = None
+        masker = _exact_masker(vocabulary)
+        # Trie DFS costs ~0.4 ms for a 32K vocabulary versus ~16 ms for the stateless
+        # re-parse of every token; both are pinned to the same verdict by the parity tests.
+        fast = getattr(masker, "mask", None) if masker is not None else None
+        if fast is not None:
+            try:
+                indices = set(fast(prefix))
+            except BaseException as error:  # noqa: BLE001 - fall back to the stateless call
+                if _never_a_fallback(error):  # pragma: no cover
+                    raise
+                indices = None
+        if indices is None and masker is not None:
+            exact = getattr(masker, "mask_exact", None)
+            if exact is not None:
+                try:
+                    indices = set(exact(prefix))
+                except BaseException as error:  # noqa: BLE001
+                    if _never_a_fallback(error):  # pragma: no cover
+                        raise
+                    indices = None
+        if indices is None:
+            indices = set(_NATIVE.allowed_tokens(prefix, list(vocabulary), None))
         mask = [bool(text) and index in indices for index, text in enumerate(vocabulary)]
         if eos_token is not None:
             while len(mask) <= eos_token:

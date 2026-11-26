@@ -305,10 +305,22 @@ impl Pda {
             if !number_prefix_ok(&self.number, false) {
                 return self.die();
             }
+            // A positive exponent is monotone: extra digits can only make an overflow
+            // worse, so an overflowing literal is already dead (``72E934`` used to stay
+            // alive here while the strict parser said invalid).  A negative exponent can
+            // still shrink the value into range (``9…9e-4`` overflows, ``9…9e-400`` is
+            // finite), so it must stay open.
+            if has_exponent(&self.number)
+                && number_prefix_ok(&self.number, true)
+                && !exponent_can_shrink(&self.number)
+                && !number_is_finite(&self.number)
+            {
+                return self.die();
+            }
             return true;
         }
         // The number ends here: it must be complete, then this char is structural again.
-        if !number_prefix_ok(&self.number, true) {
+        if !number_prefix_ok(&self.number, true) || !number_is_finite(&self.number) {
             return self.die();
         }
         self.number.clear();
@@ -337,7 +349,7 @@ impl Pda {
     pub fn finish(&self) -> Option<Pda> {
         let mut finished = self.clone();
         if finished.mode == Mode::Number {
-            if !number_prefix_ok(&finished.number, true) {
+            if !number_prefix_ok(&finished.number, true) || !number_is_finite(&finished.number) {
                 return None;
             }
             finished.number.clear();
@@ -352,6 +364,89 @@ impl Pda {
 
     pub fn accepts(&self) -> bool {
         self.finish().is_some()
+    }
+
+    /// Could a token *starting* with this byte possibly keep the machine alive?
+    ///
+    /// This is the cheap half of the XGrammar-style partition: it only looks at the current
+    /// `(Mode, Need)` and the first byte, so a caller can drop most of the vocabulary before
+    /// cloning the automaton.  It is deliberately conservative — `true` only means "worth
+    /// trying", and every allowed token is still replayed in full by the caller.
+    pub fn first_byte_allowed(&self, byte: u8) -> bool {
+        let ch = byte as char;
+        match &self.mode {
+            Mode::Dead => false,
+            Mode::String { .. } => !(byte < 0x20 || byte == b'"' || byte == b'\\'),
+            Mode::Escape { .. } => matches!(
+                ch,
+                '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' | 'u'
+            ),
+            Mode::Unicode { .. } => ch.is_ascii_hexdigit(),
+            Mode::Literal { word, matched } => word.as_bytes().get(*matched) == Some(&byte),
+            Mode::Number => {
+                ch.is_ascii_digit()
+                    || matches!(ch, '-' | '+' | '.' | 'e' | 'E' | ',' | ']' | '}')
+                    || ch.is_ascii_whitespace()
+            }
+            Mode::Structure => {
+                if ch.is_ascii_whitespace() {
+                    // Whitespace is legal in front of every structural expectation.
+                    return true;
+                }
+                match self.need {
+                Need::Stop => false,
+                Need::Colon => ch == ':',
+                Need::Comma => {
+                    ch == ','
+                        || (ch == ']' && matches!(self.stack.last(), Some(Frame::Array)))
+                        || (ch == '}' && matches!(self.stack.last(), Some(Frame::Object)))
+                }
+                Need::Key | Need::KeyOrClose => {
+                    ch == '"' || (self.need == Need::KeyOrClose && ch == '}')
+                }
+                Need::Value | Need::ValueOrClose => {
+                    matches!(ch, '"' | '{' | '[' | 't' | 'f' | 'n' | '-' | '0'..='9')
+                        || (self.need == Need::ValueOrClose
+                            && ((ch == ']' && matches!(self.stack.last(), Some(Frame::Array)))
+                                || (ch == '}'
+                                    && matches!(self.stack.last(), Some(Frame::Object)))))
+                }
+                }
+            }
+        }
+    }
+
+    /// Like [`Pda::candidates`], but skips tokens whose first byte cannot possibly advance the
+    /// machine. On a real BPE vocabulary this removes ~90% of the clone-and-replay work.
+    pub fn candidates_classified(&self, classes: &TokenClasses) -> Vec<u32> {
+        let mut allowed = Vec::new();
+        for (index, token) in classes.tokens.iter().enumerate() {
+            if let Some(byte) = classes.first_byte[index] {
+                if !self.first_byte_allowed(byte) {
+                    continue;
+                }
+            }
+            let mut probe = self.clone();
+            if probe.push_str(token) {
+                allowed.push(index as u32);
+            }
+        }
+        allowed
+    }
+
+    /// [`Pda::mask`] over a pre-classified vocabulary.
+    pub fn mask_classified(&self, classes: &TokenClasses, eos: Option<&str>) -> Vec<u32> {
+        let mut allowed = self.candidates_classified(classes);
+        if self.finish().is_some() {
+            for (index, token) in classes.tokens.iter().enumerate() {
+                if Some(token.as_str()) == eos {
+                    allowed.push(index as u32);
+                }
+            }
+        }
+        allowed.sort_unstable();
+        allowed.dedup();
+        allowed
     }
 
     /// Indices of tokens that keep the document alive.
@@ -381,6 +476,74 @@ impl Pda {
         allowed.dedup();
         allowed
     }
+}
+
+/// Per-vocabulary facts computed once and reused on every decoding step.
+///
+/// `first_byte` is `None` for the empty token (a no-op that never changes state) and for
+/// tokens whose first character is not ASCII, which must always be replayed.
+#[derive(Clone, Debug)]
+pub struct TokenClasses {
+    tokens: Vec<String>,
+    first_byte: Vec<Option<u8>>,
+}
+
+impl TokenClasses {
+    pub fn new(vocabulary: &[String]) -> TokenClasses {
+        TokenClasses {
+            tokens: vocabulary.to_vec(),
+            first_byte: vocabulary
+                .iter()
+                .map(|token| match token.as_bytes().first() {
+                    None => None,
+                    Some(byte) if byte.is_ascii() => Some(*byte),
+                    Some(_) => None,
+                })
+                .collect(),
+        }
+    }
+
+    pub fn tokens(&self) -> &[String] {
+        &self.tokens
+    }
+
+    pub fn len(&self) -> usize {
+        self.tokens.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tokens.is_empty()
+    }
+
+    /// Tokens that the partition keeps dynamic (non-ASCII or structurally relevant).
+    pub fn dynamic_len(&self, pda: &Pda) -> usize {
+        self.first_byte
+            .iter()
+            .filter(|byte| match byte {
+                None => true,
+                Some(byte) => pda.first_byte_allowed(*byte),
+            })
+            .count()
+    }
+}
+
+/// Does the literal already spell an exponent?
+fn has_exponent(text: &str) -> bool {
+    text.as_bytes().iter().any(|b| *b == b'e' || *b == b'E')
+}
+
+/// Is the exponent already explicitly negative (so more digits lower the magnitude)?
+fn exponent_can_shrink(text: &str) -> bool {
+    match text.rfind(['e', 'E']) {
+        Some(index) => text.as_bytes().get(index + 1) == Some(&b'-'),
+        None => false,
+    }
+}
+
+/// A complete number must be representable as a finite IEEE-754 value; ``json::parse``
+/// refuses ``NaN``/``inf`` and the masker must not admit a token the parser rejects.
+fn number_is_finite(text: &str) -> bool {
+    text.parse::<f64>().map(|value| value.is_finite()).unwrap_or(false)
 }
 
 /// Is `text` a prefix of a JSON number (`complete = false`) or a whole one (`complete = true`)?
@@ -575,6 +738,70 @@ mod tests {
         }
         // An empty string is a prefix of *a value*, not of a number.
         assert!(!number_prefix_ok("", false));
+    }
+
+    #[test]
+    fn overflowing_numbers_die_like_the_strict_parser() {
+        // ``json::parse`` rejects non-finite values; the automaton must agree, otherwise a
+        // mask admits a token the decoder's own verifier then refuses.
+        for text in ["72E934", "[1e400]", "1e400", "[90e9376", "-9e999"] {
+            assert!(!feed(text).is_alive(), "{text} must be dead");
+        }
+        // A long mantissa is still rescuable by a negative exponent.
+        let mut rescued = "9".repeat(400);
+        rescued.push_str("e-400");
+        assert!(feed(&rescued).is_alive(), "long mantissa plus e-400 is finite");
+        // ... but a finished overflowing mantissa is not.
+        assert!(!feed(&"9".repeat(400)).accepts());
+    }
+
+    #[test]
+    fn classification_matches_the_full_replay() {
+        let vocabulary: Vec<String> = [
+            "{\"a\": ",
+            "}",
+            "]",
+            "\"a\"",
+            ": ",
+            "1",
+            "-2.5e3",
+            "null",
+            "tru",
+            " \n",
+            "é",
+            "<stop>",
+            "\"",
+            "\\u00e9",
+            "",
+        ]
+        .iter()
+        .map(|token| token.to_string())
+        .collect();
+        let classes = TokenClasses::new(&vocabulary);
+        for prefix in ["", "{", "{\"a\": ", "[1", "null", "\"x\"", "{\"a\": 1}"] {
+            let pda = feed(prefix);
+            assert_eq!(
+                pda.mask(&vocabulary, Some("<stop>")),
+                pda.mask_classified(&classes, Some("<stop>")),
+                "partition diverged on {:?}",
+                prefix
+            );
+        }
+        // The empty token is a no-op and must never be filtered out.
+        assert_eq!(classes.first_byte[vocabulary.len() - 1], None);
+        assert!(Pda::new().candidates_classified(&classes).contains(&14));
+
+        // A dead machine offers nothing; structure narrows the dynamic subset considerably.
+        let dead = feed("{\"a\" 1");
+        assert!(!dead.first_byte_allowed(b'"'));
+        // Only the empty token survives on a dead machine: it changes no state, so replaying
+        // it is still a no-op rather than a resurrection.
+        assert!(dead
+            .candidates_classified(&classes)
+            .iter()
+            .all(|index| *index as usize == vocabulary.len() - 1));
+        let structural = Pda::new();
+        assert!(classes.dynamic_len(&structural) < classes.len());
     }
 
     #[test]

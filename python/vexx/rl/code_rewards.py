@@ -24,7 +24,9 @@ REWARD_LADDER = {
 def execution_reward(item: dict[str, Any]) -> tuple[float, str]:
     total = int(item.get("total") or 0)
     passed = int(item.get("passed") or 0)
-    if not bool(item.get("syntax_ok", True)):
+    # ``policy_ok`` used to be ignored, so a candidate that imported ``os`` collected the
+    # neutral ``no_tests_passed`` reward instead of the syntax/policy penalty.
+    if not bool(item.get("syntax_ok", True)) or not bool(item.get("policy_ok", True)):
         return -0.5, "syntax_or_policy"
     if not bool(item.get("contract_ok", True)):
         return -0.2, "contract_violation"

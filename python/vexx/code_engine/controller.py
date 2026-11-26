@@ -73,19 +73,22 @@ class VexxCodeController(_Base):
 
     @staticmethod
     def crane_phase(prefix_text: str) -> str:
-        THINK_START = "<think>"
-        THINK_END = "</think>"
-        EXP_START = "<experiment>"
-        EXP_END = "</experiment>"
-        last_exp_open = prefix_text.rfind(EXP_START)
-        last_exp_close = prefix_text.rfind(EXP_END)
-        if last_exp_open != -1 and last_exp_open > last_exp_close:
-            return "EXPERIMENT_DESIGN"
-        last_open = prefix_text.rfind(THINK_START)
-        last_close = prefix_text.rfind(THINK_END)
-        if last_open != -1 and last_open > last_close:
-            return "UNCONSTRAINED_THINK"
-        return "STRICT_VERIFIED"
+        """CRANE phase name for ``prefix_text`` (delegates to the marker state machine).
+
+        This used to be a second implementation built on ``str.rfind``, which cannot tell a
+        half-emitted marker or a malformed nesting from a real transition.
+        """
+        from .protocol import ProtocolConfig, ProtocolTracker
+        config = ProtocolConfig()
+        tracker = ProtocolTracker(config, authorized_starts=frozenset(config.markers))
+        try:
+            tracker.feed(prefix_text)
+        except Exception:
+            pass
+        return {
+            "reasoning": "UNCONSTRAINED_THINK",
+            "experiment": "EXPERIMENT_DESIGN",
+        }.get(tracker.phase.value, "STRICT_VERIFIED")
 
     @staticmethod
     def _lex_code_state(code_prefix: str) -> dict:
@@ -179,43 +182,48 @@ class VexxCodeController(_Base):
         constraint: dict[str, Any],
         assignment: dict[str, Any],
     ) -> tuple[int, Any, tuple[float, float]]:
-        from fractions import Fraction
+        """Contract one bound from a conflicting row (delegates to ``conflict``).
 
-        from ..cache_protocol import clone_cache_generic, truncate_cache_at_token
+        The duplicated copy here ignored ``constraint["relation"]``, so a ``>=`` row was
+        contracted in the wrong direction.  :func:`conflict.contract_single_row` is the
+        single source of truth.
+        """
+        from .conflict import CodeCheckpoint, contract_single_row
         candidates = [cp for cp in self.checkpoints if cp["var"] in conflict_vars]
         if not candidates:
             raise ValueError(f"No checkpoint found for conflict core {sorted(conflict_vars)}")
-        culprit = max(candidates, key=lambda c: c["entropy"])
-        c_var = culprit["var"]
-        tok_idx = culprit["token_idx"]
-        self.bounds = dict(culprit["bounds_snapshot"])
-        coeffs = constraint["coeffs"]
-        if c_var not in coeffs:
-            raise ValueError(f"Conflict variable '{c_var}' absent from constraint coefficients")
-        a_c = Fraction(str(coeffs[c_var]))
-        if a_c == 0:
-            raise ValueError("Bound contractor needs a non-zero coefficient for the culprit")
-        rhs = Fraction(str(constraint["rhs"]))
-        rem = rhs
-        for var, coeff in coeffs.items():
-            if var == c_var:
-                continue
-            if var not in assignment:
-                raise ValueError(f"Constraint references '{var}' missing from assignment")
-            rem -= Fraction(str(coeff)) * Fraction(str(assignment[var]))
-        exact_bound = rem / a_c
-        self.last_exact_fraction = exact_bound
-        bound_float = float(exact_bound)
+        checkpoints = [
+            CodeCheckpoint(
+                variable=cp["var"],
+                token_index=int(cp["token_idx"]),
+                cache_snapshot=cp["cache"],
+                bounds_snapshot=dict(cp.get("bounds_snapshot") or {}),
+                entropy=float(cp.get("entropy", 0.0)),
+                proposed_value=float(cp.get("val", 0.0)),
+            )
+            for cp in self.checkpoints
+        ]
+        cut = contract_single_row(
+            conflict_vars,
+            dict(constraint["coeffs"]),
+            constraint["rhs"],
+            assignment,
+            checkpoints=checkpoints,
+            relation=str(constraint.get("relation", "<=")),
+        )
+        c_var = cut.variable
+        tok_idx = cut.checkpoint.token_index if cut.checkpoint is not None else 0
+        self.bounds = dict((cut.checkpoint.bounds_snapshot if cut.checkpoint else {}) or self.bounds)
+        self.last_exact_fraction = cut.bound
         lo, hi = self.bounds.get(c_var, (-float("inf"), float("inf")))
-        if a_c > 0:
-            widened_hi = __import__("math").nextafter(bound_float, float("inf"))
-            self.bounds[c_var] = (lo, min(hi, widened_hi))
+        if cut.direction == "upper":
+            self.bounds[c_var] = (lo, min(hi, cut.bound_float))
+        elif cut.direction == "lower":
+            self.bounds[c_var] = (max(lo, cut.bound_float), hi)
         else:
-            widened_lo = __import__("math").nextafter(bound_float, -float("inf"))
-            self.bounds[c_var] = (max(lo, widened_lo), hi)
-        rewound_cache = truncate_cache_at_token(clone_cache_generic(culprit["cache"]), tok_idx)
+            self.bounds[c_var] = (cut.bound_float, cut.bound_float)
         self.checkpoints = [cp for cp in self.checkpoints if cp["token_idx"] <= tok_idx]
-        return tok_idx, rewound_cache, self.bounds[c_var]
+        return tok_idx, cut.rewound_cache, self.bounds[c_var]
 
     trigger_farkas_cdcl_jumpback = single_row_bound_contractor
 
@@ -379,27 +387,13 @@ class VexxCodeController(_Base):
 
     @classmethod
     def _check_ast_policy(cls, code_str):
-        import ast as _ast
-        tree = _ast.parse(code_str)
-        for node in _ast.walk(tree):
-            if isinstance(node, (_ast.Import, _ast.ImportFrom)):
-                cls._check_import_policy(node)
-            elif isinstance(node, cls.FORBIDDEN_AST_NODES):
-                raise PermissionError(f"Forbidden AST node: {type(node).__name__}")
-            if isinstance(node, _ast.Name) and node.id in cls.FORBIDDEN_IDENTIFIERS:
-                raise PermissionError(f"Forbidden identifier: {node.id}")
-            if isinstance(node, _ast.Attribute) and node.attr.startswith("__"):
-                raise PermissionError(f"Forbidden dunder attribute: {node.attr}")
-            if isinstance(node, _ast.Attribute) and not isinstance(
-                node.value, (_ast.Name, _ast.Attribute, _ast.Call, _ast.Subscript)
-            ):
-                literal_method = (
-                    isinstance(node.value, _ast.Constant)
-                    and isinstance(node.value.value, str)
-                    and node.attr in cls.SAFE_LITERAL_ATTRIBUTES
-                )
-                if not literal_method:
-                    raise PermissionError("Forbidden attribute access on a literal")
+        """Delegate to :func:`vexx.code_engine.policy.check_ast_policy`.
+
+        The previous copy here was missing the frame/format/size checks, so code rejected by
+        the real policy could still pass through this path.
+        """
+        from .policy import check_ast_policy
+        return check_ast_policy(code_str)
 
     @classmethod
     def _sandbox_dispatch(cls, code_str, fn_name="", args=None, timeout=5.0, mode="function_call"):
@@ -408,52 +402,27 @@ class VexxCodeController(_Base):
         result = runner.run(code_str, fn_name=fn_name, args=args or [], timeout=timeout, mode=mode)
         if not result.ok:
             return False, None, None, result.error
-        return True, result.repr, result.input_after, None
+        # ``display`` is the bounded representation (never the raw object).
+        if result.serialized_kind in {"json", "literal"}:
+            try:
+                import json
+                display = json.dumps(result.result, sort_keys=True, default=str)
+            except Exception:
+                display = result.repr
+        else:
+            display = result.repr
+        return True, display, result.input_after, None
 
     @classmethod
     def safe_execute_python(cls, code_str, fn_name, test_cases):
-        import ast as _ast
-        import copy
-        import json
-        try:
-            cls._check_ast_policy(code_str)
-        except SyntaxError as e:
-            return 0, len(test_cases), [f"SyntaxError: {e}"]
-        except PermissionError as e:
-            return 0, len(test_cases), [str(e)]
+        """Verify ``code_str`` against ``test_cases`` (single implementation).
 
-        passed = 0
-        errors = []
-        for idx, tc in enumerate(test_cases):
-            original = json.loads(json.dumps(tc["input"]))
-            ok, res_repr, after_repr, error = cls._sandbox_dispatch(
-                code_str, fn_name, copy.deepcopy(original)
-            )
-            if not ok:
-                errors.append(f"Test {idx} raised {error}")
-                continue
-            try:
-                result = _ast.literal_eval(res_repr or "None")
-            except (ValueError, SyntaxError):
-                errors.append(f"Test {idx} returned a non-literal: {res_repr!r}")
-                continue
-            value_ok = (
-                result in tc["expected_one_of"]
-                if "expected_one_of" in tc
-                else result == tc.get("expected")
-            )
-            try:
-                after = _ast.literal_eval(after_repr or "None")
-            except (ValueError, SyntaxError):
-                after = after_repr
-            mutation_ok = after == original
-            if value_ok and mutation_ok:
-                passed += 1
-            elif not mutation_ok:
-                errors.append(f"Test {idx} mutated its input")
-            else:
-                errors.append(
-                    f"Test {idx} failed: got {result!r}, expected "
-                    f"{tc.get('expected', tc.get('expected_one_of'))!r}"
-                )
-        return passed, len(test_cases), errors
+        This used to re-implement the verifier with a broken result contract: because
+        ``SandboxRunner`` returned ``repr=None``, every return value was read as ``None``
+        and every test failed with ``got None``.
+        """
+        from .candidate import CandidateVerifier
+        from .config import CodeEngineConfig
+        verifier = CandidateVerifier(CodeEngineConfig())
+        report = verifier.verify_candidate(code_str, fn_name, test_cases)
+        return report.passed, report.total, list(report.errors)
